@@ -22,6 +22,8 @@ const KNOWN_VARIABLES: &[&str] = &[
     "lens",
     "iso",
     "focal_length",
+    // Path.
+    "album",
 ];
 
 /// A segment of a parsed template.
@@ -56,6 +58,7 @@ pub struct TemplateContext {
     pub lens: Option<String>,
     pub iso: Option<String>,
     pub focal_length: Option<String>,
+    pub album: Option<String>,
 }
 
 impl Template {
@@ -235,6 +238,7 @@ impl Template {
                         "focal_length" => {
                             ctx.focal_length.as_deref().unwrap_or("unknown")
                         }
+                        "album" => ctx.album.as_deref().unwrap_or("unknown"),
                         _ => "unknown",
                     };
                     result.push_str(value);
@@ -301,6 +305,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(t.expand(&ctx), "2023/08/IMG_1234.jpg");
+    }
+
+    #[test]
+    fn expand_album() {
+        let t = Template::parse("{album}/{filename}").unwrap();
+        t.validate().unwrap();
+        let ctx = TemplateContext {
+            filename: "IMG_1234".to_string(),
+            album: Some("Beach Weekend".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(t.expand(&ctx), "Beach Weekend/IMG_1234");
+        let ctx = TemplateContext::default();
+        assert_eq!(t.expand(&ctx), "unknown/");
     }
 
     #[test]
