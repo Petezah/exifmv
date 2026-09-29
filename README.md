@@ -35,6 +35,11 @@ not listed, so `--date-from folders` tries EXIF, then folder dates; listing
 `exif` explicitly lets a path date override it, e.g.
 `--date-from folders,exif`.
 
+A `folders` date need not be complete: with no full date, a year (and
+month, if named) in the album folder is used, as in `E3 2006` or
+`July 2012`. The unknown month and day expand to `00`, e.g.
+`2006/00/00/`, so such files are easy to find later.
+
 A `filename` or `folders` date is only trusted for a file whose contents
 are recognized as an image or movie, checked independently of its
 extension. If the destination template uses `{album}` and none can be

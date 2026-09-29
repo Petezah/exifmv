@@ -31,6 +31,11 @@
 //! `exif` explicitly lets a path date override it, e.g.
 //! `--date-from folders,exif`.
 //!
+//! A `folders` date need not be complete: with no full date, a year (and
+//! month, if named) in the album folder is used, as in `E3 2006` or
+//! `July 2012`. The unknown month and day expand to `00`, e.g.
+//! `2006/00/00/`, so such files are easy to find later.
+//!
 //! A `filename` or `folders` date is only trusted for a file whose contents
 //! are recognized as an image or movie, checked independently of its
 //! extension. If the destination template uses `{album}` and none can be
@@ -138,7 +143,7 @@
 //! you feel like fixing any of those or add some nice features, I look forward
 //! to merge your PRs. Beers!
 use anyhow::{Context, Result, anyhow};
-use chrono::{Datelike, Days, NaiveDate, NaiveTime, Timelike};
+use chrono::{Days, NaiveDate, NaiveTime, Timelike};
 #[cfg(feature = "color")]
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{Arg, ArgAction, ArgMatches, arg, command};
@@ -267,7 +272,9 @@ DateTime is missing or unreadable (e.g. movies, or stripped images).\n\
 A `filename` or `folders` date is trusted only for a file whose contents are\n\
 recognised as an image or movie, checked independently of the file's\n\
 extension. A `folders` date without a time expands {hour}/{minute}/{second}\n\
-as 00.\n\
+as 00. With no full date, a `folders` date may be just a year, or a year and\n\
+month, from names like `E3 2006` or `July 2012`; the unknown month/day\n\
+expand as 00.\n\
 \n\
 Examples:\n\
   --date-from folders            ➞  try EXIF, then folder dates\n\
@@ -576,7 +583,7 @@ fn is_not_hidden(entry: &DirEntry) -> bool {
 
 /// A file's date, found from one of the configured [`DateSource`]s.
 struct FoundDate {
-    date: NaiveDate,
+    date: PathDate,
     /// `None` when the source (currently only `folders`) can't supply a time.
     time: Option<(u32, u32, u32)>,
     source: DateSource,
@@ -602,7 +609,7 @@ fn date_from_exif(meta_data: Option<&exif::Exif>) -> Option<FoundDate> {
     )?;
 
     Some(FoundDate {
-        date,
+        date: date.into(),
         time: Some((
             time_stamp.hour as u32,
             time_stamp.minute as u32,
@@ -666,7 +673,7 @@ fn classify(
             DateSource::Filename => {
                 datetime_from_filename(file_stem).map(|(date, time)| {
                     FoundDate {
-                        date,
+                        date: date.into(),
                         time: time.map(|t| (t.hour(), t.minute(), t.second())),
                         source: DateSource::Filename,
                     }
@@ -736,9 +743,14 @@ fn classify(
     let date = if let Some((hour, minute, _)) = found.time
         && day_wrap(hour, minute, time_offset) == 1
     {
-        found.date.checked_add_days(Days::new(1)).with_context(|| {
-            format!("Date overflow for '{}'.", source_file.display())
-        })?
+        found
+            .date
+            .full()
+            .and_then(|date| date.checked_add_days(Days::new(1)))
+            .with_context(|| {
+                format!("Date overflow for '{}'.", source_file.display())
+            })?
+            .into()
     } else {
         found.date
     };
@@ -762,9 +774,9 @@ fn classify(
 
     // Build template context.
     let ctx = TemplateContext {
-        year: format!("{}", date.year()),
-        month: format!("{:02}", date.month()),
-        day: format!("{:02}", date.day()),
+        year: format!("{}", date.year),
+        month: format!("{:02}", date.month.unwrap_or(0)),
+        day: format!("{:02}", date.day.unwrap_or(0)),
         hour: format!("{:02}", hour),
         minute: format!("{:02}", minute),
         second: format!("{:02}", second),

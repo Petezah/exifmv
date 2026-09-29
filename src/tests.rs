@@ -573,6 +573,48 @@ fn move_image_date_from_folders() {
 }
 
 #[test]
+fn move_image_partial_folder_date() {
+    let tmp = TempDir::new().unwrap();
+    let dest_dir = tmp.path().join("dest");
+    fs::create_dir_all(&dest_dir).unwrap();
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+
+    for (folder, clip, expected) in [
+        ("E3 2006", "0164.avi", ["2006", "00", "00", "0164.avi"]),
+        ("July 2012", "0028.mp4", ["2012", "07", "00", "0028.mp4"]),
+    ] {
+        let source_dir = tmp.path().join("iPhoto").join("Current").join(folder);
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_file = source_dir.join(clip);
+        write_fake_movie(&source_file);
+
+        move_image(
+            &source_file,
+            &source_dir,
+            &dest_dir,
+            None,
+            &time_offset,
+            &template,
+            false,
+            false,
+            &[DateSource::Folders],
+            make_test_args(&[]),
+            Arc::new(MultiProgress::new()),
+        )
+        .unwrap();
+
+        let expected = expected.iter().fold(dest_dir.clone(), |p, c| p.join(c));
+        assert!(
+            expected.exists(),
+            "File should be at {}",
+            expected.display()
+        );
+    }
+}
+
+#[test]
 fn move_image_date_from_filename() {
     let tmp = TempDir::new().unwrap();
     let source_dir = tmp.path().join("source");
