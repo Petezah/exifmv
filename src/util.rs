@@ -1,4 +1,5 @@
 use crate::*;
+use chrono::{NaiveDate, NaiveTime};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::info;
 use std::{
@@ -48,34 +49,163 @@ pub(crate) fn album_from_path(dir: &Path) -> Option<String> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     dir.components().rev().find_map(|component| {
         let name = component.as_os_str().to_str()?;
-        if ALBUM_SKIP_DIRS.contains(&name.to_lowercase().as_str()) {
+        if is_album_skip_dir(name) {
             return None;
         }
         let name = strip_date_prefix(name).trim();
-        let is_date_like = name
-            .chars()
-            .all(|c| c.is_ascii_digit() || "-_. ".contains(c));
-        (!is_date_like).then(|| name.to_string())
+        (!is_date_like(name)).then(|| name.to_string())
     })
 }
 
-/// Strip a leading `YYYY-MM-DD`, `YYYY_MM_DD`, `YYYY.MM.DD` or `YYYYMMDD`
-/// date and any separators following it.
-fn strip_date_prefix(name: &str) -> &str {
+/// Derive a date from the folders an image lives in.
+///
+/// Only the album folder (see [`album_from_path`]) and the date-only folders
+/// between it and the image are considered, so an unrelated date further up,
+/// like a backup's, is never picked: `2011-07-14--Iceland/Originals` and
+/// `Trips/2011/07/14` both yield 2011-07-14, but
+/// `Backups/20190311/Trips/2011` yields nothing. The album folder's own date
+/// wins over date-only folders below it.
+pub(crate) fn date_from_folders(dir: &Path) -> Option<NaiveDate> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Date-only folders below the album folder, nearest first.
+    let mut dated = Vec::new();
+    for component in dir.components().rev() {
+        let Some(name) = component.as_os_str().to_str() else {
+            break;
+        };
+        if is_album_skip_dir(name) {
+            continue;
+        }
+        if is_date_like(name) {
+            dated.push(name);
+            continue;
+        }
+        // The album folder, which ends the search.
+        if let Some(date) = split_date_prefix(name).map(|(date, _)| date) {
+            return Some(date);
+        }
+        break;
+    }
+
+    dated
+        .iter()
+        .find_map(|name| split_date_prefix(name).map(|(date, _)| date))
+        .or_else(|| {
+            // Nested `YYYY/MM/DD` folders.
+            let [day, month, year] = dated.get(..3)? else {
+                return None;
+            };
+            if year.len() != 4 || month.len() > 2 || day.len() > 2 {
+                return None;
+            }
+            valid_date([
+                year.parse().ok()?,
+                month.parse().ok()?,
+                day.parse().ok()?,
+            ])
+        })
+}
+
+/// Derive a date, and a time if there is one, from a file name like
+/// `IMG_20190310_123456`, `PXL_20210101_123456789`, `2019-03-10 12.34.56` or
+/// `IMG-20190310-WA0001`.
+pub(crate) fn datetime_from_filename(
+    stem: &str,
+) -> Option<(NaiveDate, Option<NaiveTime>)> {
+    let bytes = stem.as_bytes();
+    (0..bytes.len()).find_map(|start| {
+        // A date starts with a digit that is not part of a longer number.
+        if !bytes[start].is_ascii_digit()
+            || (start > 0 && bytes[start - 1].is_ascii_digit())
+        {
+            return None;
+        }
+        let (parts, rest) = date_prefix_parts(&stem[start..])?;
+        let date = valid_date(parts)?;
+        let time = time_prefix(rest);
+        // Digits running on past the date without forming a time mean this
+        // was some other number.
+        if time.is_none() && rest.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        Some((date, time))
+    })
+}
+
+/// Parse a leading `HHMMSS` or `HH.MM.SS` style time, optionally preceded by
+/// one of `_`, `-`, ` ` or `T`. Digits after the seconds (e.g. milliseconds)
+/// are ignored.
+fn time_prefix(s: &str) -> Option<NaiveTime> {
+    let s = s.strip_prefix(['_', '-', ' ', 'T']).unwrap_or(s);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut parts = [0u32; 3];
+    for (n, part) in parts.iter_mut().enumerate() {
+        if n > 0 && matches!(bytes.get(i), Some(b'.' | b':' | b'-')) {
+            i += 1;
+        }
+        if bytes.len() < i + 2
+            || !bytes[i..i + 2].iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        *part = s[i..i + 2].parse().ok()?;
+        i += 2;
+    }
+    NaiveTime::from_hms_opt(parts[0], parts[1], parts[2])
+}
+
+fn is_album_skip_dir(name: &str) -> bool {
+    ALBUM_SKIP_DIRS.contains(&name.to_lowercase().as_str())
+}
+
+fn is_date_like(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_digit() || "-_. ".contains(c))
+}
+
+/// Split a leading `YYYY-MM-DD`, `YYYY_MM_DD`, `YYYY.MM.DD` or `YYYYMMDD` into
+/// its numbers and the rest of the name.
+fn date_prefix_parts(name: &str) -> Option<([u32; 3], &str)> {
     let bytes = name.as_bytes();
     let mut i = 0;
-    for (n, width) in [4, 2, 2].into_iter().enumerate() {
+    let mut parts = [0u32; 3];
+    for (n, (part, width)) in parts.iter_mut().zip([4, 2, 2]).enumerate() {
         if n > 0 && matches!(bytes.get(i), Some(b'-' | b'_' | b'.')) {
             i += 1;
         }
         if bytes.len() < i + width
             || !bytes[i..i + width].iter().all(u8::is_ascii_digit)
         {
-            return name;
+            return None;
         }
+        *part = name[i..i + width].parse().ok()?;
         i += width;
     }
-    name[i..].trim_start_matches(['-', '_', '.', ' '])
+    Some((parts, &name[i..]))
+}
+
+/// Split a leading date, as [`date_prefix_parts`], into a valid date and the
+/// rest of the name.
+fn split_date_prefix(name: &str) -> Option<(NaiveDate, &str)> {
+    let (parts, rest) = date_prefix_parts(name)?;
+    Some((valid_date(parts)?, rest))
+}
+
+/// A date from `[year, month, day]`, if it is real and plausibly a photo's.
+fn valid_date([year, month, day]: [u32; 3]) -> Option<NaiveDate> {
+    if !(1900..=2100).contains(&year) {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(year as i32, month, day)
+}
+
+/// Strip a leading `YYYY-MM-DD`, `YYYY_MM_DD`, `YYYY.MM.DD` or `YYYYMMDD`
+/// date and any separators following it.
+fn strip_date_prefix(name: &str) -> &str {
+    date_prefix_parts(name).map_or(name, |(_, rest)| {
+        rest.trim_start_matches(['-', '_', '.', ' '])
+    })
 }
 
 pub(crate) fn has_image_extension(entry: &walkdir::DirEntry) -> bool {
@@ -86,6 +216,76 @@ pub(crate) fn has_image_extension(entry: &walkdir::DirEntry) -> bool {
     } else {
         false
     }
+}
+
+/// Signatures at the start of image and movie files.
+const MEDIA_PREFIXES: &[&[u8]] = &[
+    // JPEG, PNG, GIF, PSD.
+    b"\xFF\xD8\xFF",
+    b"\x89PNG\r\n\x1A\n",
+    b"GIF87a",
+    b"GIF89a",
+    b"8BPS",
+    // TIFF and the TIFF-based RAW formats (DNG, NEF, CR2, ARW, PEF, …).
+    b"II*\0",
+    b"MM\0*",
+    // Other RAW formats: ORF, RW2, RAF, X3F, MRW.
+    b"IIRO",
+    b"IIRS",
+    b"MMOR",
+    b"IIU\0",
+    b"FUJIFILMCCD-RAW",
+    b"FOVb",
+    b"\0MRM",
+    // JPEG 2000 file and codestream.
+    b"\0\0\0\x0CjP  ",
+    b"\xFF\x4F\xFF\x51",
+    // Matroska/WebM, MPEG program stream and video, ASF/WMV, FLV, Ogg.
+    b"\x1A\x45\xDF\xA3",
+    b"\0\0\x01\xBA",
+    b"\0\0\x01\xB3",
+    b"\x30\x26\xB2\x75\x8E\x66\xCF\x11",
+    b"FLV\x01",
+    b"OggS",
+];
+
+/// How much of a file [`is_media_file`] looks at; enough for the second
+/// packet of an M2TS stream.
+const MEDIA_HEADER_SIZE: u64 = 200;
+
+/// Check a file's contents, rather than its extension, for an image or movie
+/// signature.
+pub(crate) fn is_media_file(path: &Path) -> Result<bool> {
+    let mut header = Vec::with_capacity(MEDIA_HEADER_SIZE as usize);
+    fs::File::open(path)
+        .and_then(|file| file.take(MEDIA_HEADER_SIZE).read_to_end(&mut header))
+        .with_context(|| format!("Unable to read '{}'.", path.display()))?;
+    Ok(has_media_signature(&header))
+}
+
+fn has_media_signature(header: &[u8]) -> bool {
+    let at = |offset: usize, magic: &[u8]| {
+        header.get(offset..offset + magic.len()) == Some(magic)
+    };
+    MEDIA_PREFIXES.iter().any(|magic| at(0, magic))
+        // BMP, with its reserved header bytes zero.
+        || (at(0, b"BM") && at(6, b"\0\0\0\0"))
+        // CRW.
+        || at(6, b"HEAPCCDR")
+        // ISO base media (HEIC, AVIF, MP4, MOV, 3GP, CR3, …).
+        || at(4, b"ftyp")
+        // Old QuickTime files starting with another atom; a small atom size
+        // keeps text that happens to contain these words out.
+        || (header.first() == Some(&0)
+            && [b"moov", b"mdat", b"wide", b"free", b"skip"]
+                .iter()
+                .any(|atom| at(4, *atom)))
+        // WebP, AVI, AMV.
+        || (at(0, b"RIFF")
+            && [b"WEBP", b"AVI ", b"AMV "].iter().any(|kind| at(8, *kind)))
+        // MPEG transport stream and M2TS: sync bytes 188 bytes apart.
+        || (at(0, b"G") && at(188, b"G"))
+        || (at(4, b"G") && at(196, b"G"))
 }
 
 /// Files larger than 64MB use streaming hash to avoid memory pressure.
@@ -468,5 +668,111 @@ mod tests {
         assert_eq!(album("2011_07_14_Iceland").as_deref(), Some("Iceland"));
         assert_eq!(album("2011.07.14 Iceland").as_deref(), Some("Iceland"));
         assert_eq!(album("Album-0").as_deref(), Some("Album-0"));
+    }
+
+    fn folder_date(path: &str) -> Option<NaiveDate> {
+        date_from_folders(Path::new(path))
+    }
+
+    #[test]
+    fn folder_date_from_album_prefix() {
+        let base = "Backups_Old/201903110930/Staging/2019-03-10/\
+                    iPhoto Exports/Album-0";
+        for (dir, expected) in [
+            ("2011-07-14--Iceland/Originals", (2011, 7, 14)),
+            ("2012-03-09--Beach Weekend/Originals", (2012, 3, 9)),
+            ("2013-10-21--Garden", (2013, 10, 21)),
+        ] {
+            let (y, m, d) = expected;
+            assert_eq!(
+                folder_date(&format!("{base}/{dir}")),
+                NaiveDate::from_ymd_opt(y, m, d)
+            );
+        }
+    }
+
+    #[test]
+    fn folder_date_from_nested_ymd() {
+        assert_eq!(
+            folder_date("Trips/2019/07/14"),
+            NaiveDate::from_ymd_opt(2019, 7, 14)
+        );
+    }
+
+    #[test]
+    fn folder_date_from_full_date_folder() {
+        assert_eq!(
+            folder_date("Trips/2019-03-10/Originals"),
+            NaiveDate::from_ymd_opt(2019, 3, 10)
+        );
+    }
+
+    #[test]
+    fn folder_date_none_without_full_date() {
+        // Only a year: no month/day to derive a date from.
+        assert_eq!(folder_date("Trips/2019"), None);
+        // Album folder reached with no date prefix, and nothing dated below.
+        assert_eq!(
+            folder_date("Backups_Old/201903110930/Staging/random"),
+            None
+        );
+    }
+
+    #[test]
+    fn datetime_from_filename_date_and_time() {
+        assert_eq!(
+            datetime_from_filename("IMG_20190310_123456"),
+            Some((
+                NaiveDate::from_ymd_opt(2019, 3, 10).unwrap(),
+                NaiveTime::from_hms_opt(12, 34, 56)
+            ))
+        );
+        // Trailing milliseconds after the seconds are ignored.
+        assert_eq!(
+            datetime_from_filename("PXL_20210101_123456789"),
+            Some((
+                NaiveDate::from_ymd_opt(2021, 1, 1).unwrap(),
+                NaiveTime::from_hms_opt(12, 34, 56)
+            ))
+        );
+        assert_eq!(
+            datetime_from_filename("2019-03-10 12.34.56"),
+            Some((
+                NaiveDate::from_ymd_opt(2019, 3, 10).unwrap(),
+                NaiveTime::from_hms_opt(12, 34, 56)
+            ))
+        );
+    }
+
+    #[test]
+    fn datetime_from_filename_date_only() {
+        assert_eq!(
+            datetime_from_filename("Screenshot 2019-03-10 at 3.34.56 pm"),
+            Some((NaiveDate::from_ymd_opt(2019, 3, 10).unwrap(), None))
+        );
+        assert_eq!(
+            datetime_from_filename("IMG-20190310-WA0001"),
+            Some((NaiveDate::from_ymd_opt(2019, 3, 10).unwrap(), None))
+        );
+    }
+
+    #[test]
+    fn datetime_from_filename_rejects_non_dates() {
+        assert_eq!(datetime_from_filename("IMG_1234"), None);
+        // Invalid month.
+        assert_eq!(datetime_from_filename("20191340"), None);
+        // No left boundary: part of a longer run of digits.
+        assert_eq!(datetime_from_filename("123201903101"), None);
+    }
+
+    #[test]
+    fn media_signatures() {
+        assert!(has_media_signature(b"\xFF\xD8\xFF\xE0\0\x10JFIF"));
+        assert!(has_media_signature(b"\x89PNG\r\n\x1A\n\0\0\0\rIHDR"));
+        assert!(has_media_signature(b"II*\0\x08\0\0\0"));
+        assert!(has_media_signature(b"\0\0\0\x18ftypmp42\0\0\0\0mp42isom"));
+        assert!(has_media_signature(b"RIFF\0\0\0\0WEBPVP8 "));
+        assert!(!has_media_signature(b"just some plain text data"));
+        assert!(!has_media_signature(b""));
     }
 }

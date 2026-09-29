@@ -3,10 +3,12 @@
 //! All tests use `tempfile::TempDir` which creates directories in the system
 //! temp directory, ensuring no artifacts are left in the source tree.
 
-use crate::{Template, TemplateContext, day_wrap, move_image, util::move_file};
+use crate::{
+    Template, TemplateContext, config::DateSource, day_wrap, move_image,
+    util::move_file,
+};
 use chrono::NaiveTime;
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use exif::DateTime;
 use indicatif::MultiProgress;
 use std::{fs, io::Write, path::Path, sync::Arc};
 use tempfile::TempDir;
@@ -383,6 +385,7 @@ fn move_image_creates_date_hierarchy() {
         &template,
         false,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -420,6 +423,7 @@ fn move_image_missing_exif_fails() {
         &template,
         false,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     );
@@ -451,6 +455,7 @@ fn move_image_respects_custom_template() {
         &template,
         false,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -488,6 +493,7 @@ fn move_image_album_from_folder() {
         &template,
         false,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -498,6 +504,235 @@ fn move_image_album_from_folder() {
         expected.exists(),
         "File should be at {}",
         expected.display()
+    );
+}
+
+/// A minimal ISO-BMFF ("ftyp") header, recognized as a movie by
+/// `is_media_file` regardless of its extension.
+fn write_fake_movie(path: &Path) {
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&0x18u32.to_be_bytes());
+    data.extend_from_slice(b"ftypmp42");
+    data.extend_from_slice(b"\0\0\0\0mp42isom");
+    fs::write(path, data).expect("Failed to write fake movie");
+}
+
+#[test]
+fn move_image_date_from_folders() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("2011-07-14--Iceland").join("Originals");
+    let dest_dir = tmp.path().join("dest");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&dest_dir).unwrap();
+
+    // No EXIF at all; the date must come from the folder name.
+    let source_file = source_dir.join("photo.jpg");
+    create_jpeg_without_exif(&source_file);
+
+    let template = Template::parse(
+        "{year}/{year}-{month}-{day} {album}/{filename}.{extension}",
+    )
+    .unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    let args = make_test_args(&[]);
+
+    move_image(
+        &source_file,
+        &dest_dir,
+        &time_offset,
+        &template,
+        false,
+        false,
+        &[DateSource::Folders],
+        args,
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    let expected = dest_dir
+        .join("2011")
+        .join("2011-07-14 Iceland")
+        .join("photo.jpg");
+    assert!(
+        expected.exists(),
+        "File should be at {}",
+        expected.display()
+    );
+}
+
+#[test]
+fn move_image_date_from_filename() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("source");
+    let dest_dir = tmp.path().join("dest");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&dest_dir).unwrap();
+
+    // A movie: exif can't be read from it at all.
+    let source_file = source_dir.join("VID_20190310_235900.mp4");
+    write_fake_movie(&source_file);
+
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    // A day-wrap of 00:01 pushes 23:59 into the next day.
+    let time_offset = NaiveTime::from_hms_opt(0, 1, 0).unwrap();
+    let args = make_test_args(&[]);
+
+    move_image(
+        &source_file,
+        &dest_dir,
+        &time_offset,
+        &template,
+        false,
+        false,
+        &[DateSource::Filename],
+        args,
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    let expected = dest_dir.join("2019/03/11/VID_20190310_235900.mp4");
+    assert!(
+        expected.exists(),
+        "File should be at {}",
+        expected.display()
+    );
+}
+
+#[test]
+fn move_image_rejects_non_media_with_path_date() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("2019-03-10");
+    let dest_dir = tmp.path().join("dest");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&dest_dir).unwrap();
+
+    // Garbage content behind a movie extension.
+    let source_file = source_dir.join("not_really_a_movie.mp4");
+    fs::write(&source_file, b"this is not a movie").unwrap();
+
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    let args = make_test_args(&[]);
+
+    let result = move_image(
+        &source_file,
+        &dest_dir,
+        &time_offset,
+        &template,
+        false,
+        false,
+        &[DateSource::Folders],
+        args,
+        Arc::new(MultiProgress::new()),
+    );
+
+    assert!(result.is_err(), "Should refuse a non-media file");
+    assert!(source_file.exists(), "Source should be preserved on error");
+}
+
+// `require_album_if_needed()` is tested directly rather than through
+// `move_image`: any real file's canonicalized path has *some* named
+// ancestor, so `album_from_path` never actually returns `None` for it (the
+// filesystem always has a folder name to fall back on somewhere above the
+// temp directory used in these tests).
+#[test]
+fn require_album_if_needed_only_for_path_dates_using_album() {
+    let path = Path::new("photo.jpg");
+    let with_album = Template::parse("{year}/{album}/{filename}").unwrap();
+    let without_album = Template::parse("{year}/{filename}").unwrap();
+
+    // EXIF dates never require an album, whatever the template.
+    assert!(
+        crate::require_album_if_needed(
+            DateSource::Exif,
+            &with_album,
+            None,
+            path
+        )
+        .is_ok()
+    );
+    // A path date is fine when the template doesn't reference {album}.
+    assert!(
+        crate::require_album_if_needed(
+            DateSource::Folders,
+            &without_album,
+            None,
+            path
+        )
+        .is_ok()
+    );
+    // A path date with an album found is fine.
+    assert!(
+        crate::require_album_if_needed(
+            DateSource::Folders,
+            &with_album,
+            Some("Iceland"),
+            path
+        )
+        .is_ok()
+    );
+    // A path date, a template that uses {album}, and no album: an error.
+    assert!(
+        crate::require_album_if_needed(
+            DateSource::Filename,
+            &with_album,
+            None,
+            path
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn move_image_date_source_priority() {
+    // EXIF says 2024-12-25; the filename says 2015-05-05; the folder says
+    // 2011-07-14.
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("2011-07-14--Trip");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("IMG_20150505_120000.jpg");
+
+    let template =
+        Template::parse("{year}-{month}-{day}/{filename}.{extension}").unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+
+    let run = |sources: &[DateSource]| -> String {
+        // move_image() moves the source away; put it back for each run.
+        create_test_jpeg(&source_file, "2024:12:25 10:00:00");
+        let dest_dir = TempDir::new().unwrap();
+        move_image(
+            &source_file,
+            dest_dir.path(),
+            &time_offset,
+            &template,
+            false,
+            false,
+            sources,
+            make_test_args(&[]),
+            Arc::new(MultiProgress::new()),
+        )
+        .unwrap();
+        std::fs::read_dir(dest_dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .to_string()
+    };
+
+    assert_eq!(run(&[DateSource::Exif, DateSource::Folders]), "2024-12-25");
+    assert_eq!(run(&[DateSource::Folders, DateSource::Exif]), "2011-07-14");
+    assert_eq!(
+        run(&[DateSource::Filename, DateSource::Folders]),
+        "2015-05-05"
+    );
+    assert_eq!(
+        run(&[DateSource::Folders, DateSource::Filename]),
+        "2011-07-14"
     );
 }
 
@@ -523,6 +758,7 @@ fn move_image_lowercase_option() {
         &template,
         true,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -557,6 +793,7 @@ fn move_image_day_wrap_shifts_date() {
         &template,
         false,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -596,6 +833,7 @@ fn xmp_sidecar_moves_with_image() {
         &template,
         false,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -634,6 +872,7 @@ fn xmp_uppercase_moves_with_image() {
         &template,
         false,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -667,6 +906,7 @@ fn xmp_lowercase_conversion() {
         &template,
         true,
         false,
+        &[DateSource::Exif],
         args,
         Arc::new(MultiProgress::new()),
     )
@@ -685,52 +925,22 @@ fn xmp_lowercase_conversion() {
 
 #[test]
 fn day_wrap_no_wrap_early_time() {
-    let ts = DateTime {
-        year: 2023,
-        month: 8,
-        day: 15,
-        hour: 10,
-        minute: 30,
-        second: 0,
-        nanosecond: None,
-        offset: None,
-    };
     let offset = NaiveTime::from_hms_opt(4, 0, 0).unwrap();
-    assert_eq!(day_wrap(&ts, &offset), 0);
+    assert_eq!(day_wrap(10, 30, &offset), 0);
 }
 
 #[test]
 fn day_wrap_wraps_late_night() {
-    let ts = DateTime {
-        year: 2023,
-        month: 8,
-        day: 15,
-        hour: 22,
-        minute: 0,
-        second: 0,
-        nanosecond: None,
-        offset: None,
-    };
     let offset = NaiveTime::from_hms_opt(4, 0, 0).unwrap();
     // 22 + 4 = 26 > 23, so wraps.
-    assert_eq!(day_wrap(&ts, &offset), 1);
+    assert_eq!(day_wrap(22, 0, &offset), 1);
 }
 
 #[test]
 fn day_wrap_minute_overflow_causes_wrap() {
-    let ts = DateTime {
-        year: 2023,
-        month: 8,
-        day: 15,
-        hour: 23,
-        minute: 30,
-        second: 0,
-        nanosecond: None,
-        offset: None,
-    };
     let offset = NaiveTime::from_hms_opt(0, 31, 0).unwrap();
     // 23:30 + 0:31 = 24:01, minute overflow adds 1 to hour check.
-    assert_eq!(day_wrap(&ts, &offset), 1);
+    assert_eq!(day_wrap(23, 30, &offset), 1);
 }
 
 // =============================================================================
@@ -1051,6 +1261,7 @@ fn collision_sidecar_follows_renamed_image() {
         &template,
         false,
         true,
+        &[DateSource::Exif],
         make_test_args(&["--checksum"]),
         Arc::new(MultiProgress::new()),
     )

@@ -24,6 +24,22 @@ events in the path, like old iPhoto exports: an image in
 
 Run `exifmv --help` for full variable descriptions and examples.
 
+## Files Without EXIF
+
+Movies, and images whose EXIF has been stripped, have no `DateTimeOriginal`
+to sort by. `--date-from` names sources to try instead, in priority order:
+`filename` (a date, and optionally a time, encoded in the file name, e.g.
+`IMG_20190310_123456.jpg`) and `folders` (a date encoded in the names of
+the containing folders, as for `album` above). `exif` is implied first if
+not listed, so `--date-from folders` tries EXIF, then folder dates; listing
+`exif` explicitly lets a path date override it, e.g.
+`--date-from folders,exif`.
+
+A `filename` or `folders` date is only trusted for a file whose contents
+are recognized as an image or movie, checked independently of its
+extension. If the destination template uses `{album}` and none can be
+found, the file is skipped rather than filed under `unknown`.
+
 ## Example
 
 If you have an image shot on _Aug. 15 2020_ named
@@ -56,21 +72,22 @@ false positives from same-size different-content files.
 
 ## Name Collisions
 
-When two different photos would land on the same destination name, the second
-one is moved aside as `IMG_1234_1.jpg`, `IMG_1234_2.jpg` and so on; an existing
-file is never overwritten. A source that matches a file already at any of those
-names is treated as a duplicate instead, so re-running `exifmv` over the same
-photos does not pile up extra copies. XMP sidecars follow the name their image
-ended up with.
+When two different photos would land on the same destination name, the
+second one is moved aside as `IMG_1234_1.jpg`, `IMG_1234_2.jpg` and so on;
+an existing file is never overwritten. A source that matches a file already
+at any of those names is treated as a duplicate instead, so re-running
+`exifmv` over the same photos does not pile up extra copies. XMP sidecars
+follow the name their image ended up with.
 
-Note that "different" is judged by file size unless `--checksum` is given, so
-same-size different-content photos are still taken for duplicates by default.
+Note that "different" is judged by file size unless `--checksum` is given,
+so same-size different-content photos are still taken for duplicates by
+default.
 
-`--dry-run` predicts these names: it keeps track of the names it hands out, so
-colliding files are reported under the names a real run would give them, and a
-photo matching one already accounted for is reported as a duplicate. Files are
-processed in parallel, so which photo gets which number can differ between
-runs; the set of names does not.
+`--dry-run` predicts these names: it keeps track of the names it hands
+out, so colliding files are reported under the names a real run would give
+them, and a photo matching one already accounted for is reported as a
+duplicate. Files are processed in parallel, so which photo gets which
+number can differ between runs; the set of names does not.
 
 ## Configuration File
 
@@ -86,6 +103,7 @@ verbose = false
 halt-on-errors = false
 dereference = false
 checksum = false
+date-from = ["folders", "filename"]
 ```
 
 CLI arguments override config file settings.
