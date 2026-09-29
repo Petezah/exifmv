@@ -34,7 +34,24 @@
 //! A `filename` or `folders` date is only trusted for a file whose contents
 //! are recognized as an image or movie, checked independently of its
 //! extension. If the destination template uses `{album}` and none can be
-//! found, the file is skipped rather than filed under `unknown`.
+//! found, the file is skipped rather than filed under `unknown`. See
+//! `--unclassified` below for filing these files instead of skipping them.
+//!
+//! # Unclassifiable Files
+//!
+//! By default a file `exifmv` can't sort — no date from any `--date-from`
+//! source, a filename/folders date on something not recognized as media, or
+//! a missing `{album}` — is left in place, reported, and (with
+//! `--halt-on-errors`) treated as a failure.
+//!
+//! `--unclassified DIR` files such files into `DIR` instead, keeping each
+//! one's path relative to SOURCE (e.g. `SOURCE/2011 trip/misc/clip.avi` ends
+//! up at `DIR/2011 trip/misc/clip.avi`). This also covers any other,
+//! non-hidden file under SOURCE that isn't recognized as an image or movie
+//! by extension — so a run with `--unclassified` set can be pointed at a
+//! folder of mixed content and sort out everything it recognizes. An XMP
+//! sidecar always follows whichever path its image ends up at, sorted or
+//! not.
 //!
 //! # Example
 //!
@@ -100,6 +117,7 @@
 //! dereference = false
 //! checksum = false
 //! date-from = ["folders", "filename"]
+//! unclassified = "unsorted"
 //! ```
 //!
 //! CLI arguments override config file settings.
@@ -316,6 +334,25 @@ Examples:\n\
     ➞  2011/2011-07-14 Iceland/IMG_1234.jpg"),
         )
         .arg(
+            Arg::new("unclassified")
+                .long("unclassified")
+                .value_name("DIR")
+                .help("Move files that can't be sorted here instead of leaving them in place")
+                .long_help("\
+Move files exifmv can't sort into DIR instead of leaving them at SOURCE,\n\
+each keeping its path relative to SOURCE (e.g. a file at\n\
+'SOURCE/2011 trip/misc/clip.avi' ends up at 'DIR/2011 trip/misc/clip.avi').\n\
+\n\
+This covers:\n\
+  - images/movies with no date from any --date-from source\n\
+  - a filename/folders date on a file not recognized as media\n\
+  - a template using {album} with none found in the path\n\
+  - any other, non-hidden file under SOURCE that isn't an image or movie\n\
+\n\
+An XMP sidecar still follows whichever path its image ends up at.\n\
+Files already under DIR (e.g. from a previous run) are left alone."),
+        )
+        .arg(
             Arg::new("config")
                 .short('c')
                 .long("config")
@@ -401,39 +438,33 @@ Examples:\n\
     );
 
     let source: &String = args.get_one("SOURCE").unwrap();
+    let source_root = PathBuf::from(source);
     let dest_dir =
         PathBuf::from(args.get_one::<String>("DESTINATION").unwrap());
+    let unclassified_dir = args
+        .get_one::<String>("unclassified")
+        .map(PathBuf::from)
+        .or(app_config.unclassified);
 
-    // Note: `contents_first(true)` must not be combined with `filter_entry`;
-    // walkdir ends the iteration early when a directory is filtered out,
-    // silently skipping everything after it.
-    let files = WalkDir::new(source)
-        .max_depth(if recursive { usize::MAX } else { 1 })
-        .follow_links(dereference)
-        .sort_by(|a, b| a.file_name().cmp(b.file_name()))
-        .into_iter()
-        .filter_entry(is_not_hidden)
-        .filter_map(|e| match e {
-            Ok(e) => Some(e),
-            // Report unreadable entries but keep walking the rest of the tree.
-            Err(e) => {
-                warn!("{:#}", e);
-                None
-            }
-        })
-        .filter(|e| e.file_type().is_file() && has_image_extension(e))
-        .collect::<Vec<_>>();
+    let (media_files, other_files) = collect_files(
+        &source_root,
+        recursive,
+        dereference,
+        unclassified_dir.as_deref(),
+    );
 
     let args = Arc::new(args);
     let template = Arc::new(template);
     let multi = Arc::new(multi);
 
-    let errors: Vec<_> = files
+    let errors: Vec<_> = media_files
         .par_iter()
         .filter_map(|file| {
             let result = move_image(
                 file.path(),
+                &source_root,
                 &dest_dir,
+                unclassified_dir.as_deref(),
                 &time_offset,
                 &template,
                 make_lowercase,
@@ -450,6 +481,26 @@ Examples:\n\
                 }
             }
         })
+        .chain(other_files.par_iter().filter_map(|file| {
+            // `collect_files` only returns "other" files when
+            // `unclassified_dir` is set.
+            let dir = unclassified_dir.as_deref().unwrap();
+            let result = move_unclassified(
+                file.path(),
+                &source_root,
+                dir,
+                checksum,
+                args.clone(),
+                multi.clone(),
+            );
+            match result {
+                Ok(()) => None,
+                Err(e) => {
+                    warn!("{:#}", e);
+                    Some(e)
+                }
+            }
+        }))
         .collect();
 
     if halt && !errors.is_empty() {
@@ -457,6 +508,62 @@ Examples:\n\
     } else {
         Ok(())
     }
+}
+
+/// Walk `source`, splitting entries into sortable media files and, when
+/// `unclassified` is set, every other non-hidden file (excluding XMP
+/// sidecars of a media file, which follow their image).
+///
+/// Note: `contents_first(true)` must not be combined with `filter_entry`;
+/// walkdir ends the iteration early when a directory is filtered out,
+/// silently skipping everything after it.
+fn collect_files(
+    source: &Path,
+    recursive: bool,
+    dereference: bool,
+    unclassified: Option<&Path>,
+) -> (Vec<DirEntry>, Vec<DirEntry>) {
+    // Skip the unclassified folder itself if it happens to live inside
+    // SOURCE, so a re-run doesn't file its own output back into itself.
+    let unclassified_canon = unclassified.and_then(|d| d.canonicalize().ok());
+
+    let mut media_files = Vec::new();
+    let mut other_files = Vec::new();
+
+    WalkDir::new(source)
+        .max_depth(if recursive { usize::MAX } else { 1 })
+        .follow_links(dereference)
+        .sort_by(|a, b| a.file_name().cmp(b.file_name()))
+        .into_iter()
+        .filter_entry(|e| {
+            is_not_hidden(e)
+                && match &unclassified_canon {
+                    Some(dir) => e
+                        .path()
+                        .canonicalize()
+                        .map(|p| p != *dir)
+                        .unwrap_or(true),
+                    None => true,
+                }
+        })
+        .filter_map(|e| match e {
+            Ok(e) => Some(e),
+            // Report unreadable entries but keep walking the rest of the tree.
+            Err(e) => {
+                warn!("{:#}", e);
+                None
+            }
+        })
+        .filter(|e| e.file_type().is_file())
+        .for_each(|e| {
+            if has_image_extension(&e) {
+                media_files.push(e);
+            } else if unclassified.is_some() && !is_sidecar_of_media(e.path()) {
+                other_files.push(e);
+            }
+        });
+
+    (media_files, other_files)
 }
 
 fn is_not_hidden(entry: &DirEntry) -> bool {
@@ -505,18 +612,31 @@ fn date_from_exif(meta_data: Option<&exif::Exif>) -> Option<FoundDate> {
     })
 }
 
+/// Marks an error as meaning "this file can't be sorted", as opposed to an
+/// I/O failure. When `--unclassified` is set, an error of this kind routes
+/// the file there instead of being reported as a failure.
+#[derive(Debug)]
+struct Unclassifiable(String);
+
+impl std::fmt::Display for Unclassifiable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Unclassifiable {}
+
+/// The relative destination path an image, EXIF metadata (for sidecars, if
+/// wanted later), and the file's found date decided together, without
+/// touching the filesystem beyond reading `source_file` itself.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn move_image(
+fn classify(
     source_file: &Path,
-    dest_dir: &Path,
     time_offset: &NaiveTime,
     template: &Template,
     make_lowercase: bool,
-    checksum: bool,
     date_sources: &[DateSource],
-    args: Arc<ArgMatches>,
-    multi: Arc<MultiProgress>,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let source_file_handle =
         std::fs::File::open(source_file).with_context(|| {
             format!("Unable to open '{}'.", source_file.display())
@@ -561,8 +681,8 @@ pub(crate) fn move_image(
                     source: DateSource::Folders,
                 }),
         })
-        .with_context(|| {
-            format!(
+        .ok_or_else(|| {
+            Unclassifiable(format!(
                 "No timestamp in {} of '{}'.",
                 date_sources
                     .iter()
@@ -574,7 +694,7 @@ pub(crate) fn move_image(
                     .collect::<Vec<_>>()
                     .join(" or "),
                 source_file.display()
-            )
+            ))
         })?;
 
     // A date taken from the path is only trusted for a file that is really
@@ -587,7 +707,7 @@ pub(crate) fn move_image(
             )
         })?
     {
-        return Err(anyhow!(
+        return Err(anyhow!(Unclassifiable(format!(
             "'{}' is not recognized as an image or movie; refusing to trust \
              its {} date.",
             source_file.display(),
@@ -596,7 +716,7 @@ pub(crate) fn move_image(
             } else {
                 "folder"
             }
-        ));
+        ))));
     }
 
     if found.source != DateSource::Exif {
@@ -668,8 +788,21 @@ pub(crate) fn move_image(
     };
 
     // Expand template to get relative path.
-    let relative_path = template.expand(&ctx);
-    let dest_file = dest_dir.join(&relative_path);
+    Ok(PathBuf::from(template.expand(&ctx)))
+}
+
+/// Move `source_file` to `dest_dir.join(relative_path)`, creating parent
+/// directories as needed, then move along any XMP sidecar.
+fn move_with_sidecars(
+    source_file: &Path,
+    dest_dir: &Path,
+    relative_path: &Path,
+    make_lowercase: bool,
+    checksum: bool,
+    args: Arc<ArgMatches>,
+    multi: Arc<MultiProgress>,
+) -> Result<()> {
+    let dest_file = dest_dir.join(relative_path);
 
     // Create parent directories.
     if let Some(parent) = dest_file.parent()
@@ -717,6 +850,102 @@ pub(crate) fn move_image(
     Ok(())
 }
 
+/// `source_file`'s path relative to `source_root`, for filing it elsewhere
+/// while preserving its place in the tree. Falls back to just the file name
+/// if `source_root` is the file itself (a non-recursive run given a file as
+/// SOURCE) or otherwise not a prefix of it.
+pub(crate) fn relative_to_source(
+    source_file: &Path,
+    source_root: &Path,
+) -> PathBuf {
+    match source_file.strip_prefix(source_root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => {
+            relative.to_path_buf()
+        }
+        _ => PathBuf::from(
+            source_file.file_name().unwrap_or(source_file.as_os_str()),
+        ),
+    }
+}
+
+/// Sort `source_file` into `dest_dir` via `--format`, or, if it can't be
+/// classified and `unclassified` is set, file it there instead, keeping its
+/// path relative to `source_root`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn move_image(
+    source_file: &Path,
+    source_root: &Path,
+    dest_dir: &Path,
+    unclassified: Option<&Path>,
+    time_offset: &NaiveTime,
+    template: &Template,
+    make_lowercase: bool,
+    checksum: bool,
+    date_sources: &[DateSource],
+    args: Arc<ArgMatches>,
+    multi: Arc<MultiProgress>,
+) -> Result<()> {
+    match classify(
+        source_file,
+        time_offset,
+        template,
+        make_lowercase,
+        date_sources,
+    ) {
+        Ok(relative_path) => move_with_sidecars(
+            source_file,
+            dest_dir,
+            &relative_path,
+            make_lowercase,
+            checksum,
+            args,
+            multi,
+        ),
+        Err(e)
+            if unclassified.is_some()
+                && e.downcast_ref::<Unclassifiable>().is_some() =>
+        {
+            let dir = unclassified.unwrap();
+            info!(
+                "{:#} Moving '{}' to unclassified instead.",
+                e,
+                source_file.display()
+            );
+            move_with_sidecars(
+                source_file,
+                dir,
+                &relative_to_source(source_file, source_root),
+                false,
+                checksum,
+                args,
+                multi,
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Move a non-media file (or one exifmv doesn't otherwise touch) straight
+/// into the unclassified folder, keeping its path relative to `source_root`.
+fn move_unclassified(
+    source_file: &Path,
+    source_root: &Path,
+    dir: &Path,
+    checksum: bool,
+    args: Arc<ArgMatches>,
+    multi: Arc<MultiProgress>,
+) -> Result<()> {
+    move_with_sidecars(
+        source_file,
+        dir,
+        &relative_to_source(source_file, source_root),
+        false,
+        checksum,
+        args,
+        multi,
+    )
+}
+
 /// Extract a string value from EXIF metadata.
 /// Spaces are replaced with hyphens for filesystem-friendly paths.
 /// A date taken from the path (rather than EXIF) is only good enough for a
@@ -732,10 +961,10 @@ pub(crate) fn require_album_if_needed(
         && template.uses("album")
         && album.is_none()
     {
-        return Err(anyhow!(
+        return Err(anyhow!(Unclassifiable(format!(
             "No album found in the path of '{}'.",
             source_file.display()
-        ));
+        ))));
     }
     Ok(())
 }

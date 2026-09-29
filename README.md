@@ -38,7 +38,24 @@ not listed, so `--date-from folders` tries EXIF, then folder dates; listing
 A `filename` or `folders` date is only trusted for a file whose contents
 are recognized as an image or movie, checked independently of its
 extension. If the destination template uses `{album}` and none can be
-found, the file is skipped rather than filed under `unknown`.
+found, the file is skipped rather than filed under `unknown`. See
+`--unclassified` below for filing these files instead of skipping them.
+
+## Unclassifiable Files
+
+By default a file `exifmv` can't sort — no date from any `--date-from`
+source, a filename/folders date on something not recognized as media, or
+a missing `{album}` — is left in place, reported, and (with
+`--halt-on-errors`) treated as a failure.
+
+`--unclassified DIR` files such files into `DIR` instead, keeping each
+one's path relative to SOURCE (e.g. `SOURCE/2011 trip/misc/clip.avi` ends
+up at `DIR/2011 trip/misc/clip.avi`). This also covers any other,
+non-hidden file under SOURCE that isn't recognized as an image or movie
+by extension — so a run with `--unclassified` set can be pointed at a
+folder of mixed content and sort out everything it recognizes. An XMP
+sidecar always follows whichever path its image ends up at, sorted or
+not.
 
 ## Example
 
@@ -104,6 +121,7 @@ halt-on-errors = false
 dereference = false
 checksum = false
 date-from = ["folders", "filename"]
+unclassified = "unsorted"
 ```
 
 CLI arguments override config file settings.

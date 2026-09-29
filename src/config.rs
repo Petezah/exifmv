@@ -81,6 +81,9 @@ pub struct Config {
     /// Sources to try a file's date from, in priority order, when EXIF alone
     /// isn't enough. `exif` is implied first if not listed.
     pub date_from: Option<Vec<DateSource>>,
+    /// Folder for files that can't be sorted, keeping their path relative to
+    /// the search root.
+    pub unclassified: Option<PathBuf>,
 }
 
 impl Config {
@@ -111,6 +114,7 @@ format = "{year}-{month}-{day}/{filename}.{extension}"
 make-lowercase = true
 day-wrap = "04:00"
 verbose = false
+unclassified = "unsorted"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(
@@ -120,6 +124,7 @@ verbose = false
         assert_eq!(config.make_lowercase, Some(true));
         assert_eq!(config.day_wrap.as_deref(), Some("04:00"));
         assert_eq!(config.verbose, Some(false));
+        assert_eq!(config.unclassified, Some(PathBuf::from("unsorted")));
     }
 
     #[test]
@@ -128,6 +133,7 @@ verbose = false
         assert!(config.format.is_none());
         assert!(config.make_lowercase.is_none());
         assert!(config.date_from.is_none());
+        assert!(config.unclassified.is_none());
     }
 
     #[test]

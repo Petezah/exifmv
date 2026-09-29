@@ -209,13 +209,32 @@ fn strip_date_prefix(name: &str) -> &str {
 }
 
 pub(crate) fn has_image_extension(entry: &walkdir::DirEntry) -> bool {
-    if let Some(extension) = PathBuf::from(entry.file_name()).extension()
+    has_image_extension_str(entry.file_name().to_str().unwrap_or(""))
+}
+
+fn has_image_extension_str(file_name: &str) -> bool {
+    if let Some(extension) = Path::new(file_name).extension()
         && let Some(extension) = extension.to_str()
     {
         EXTENSIONS.contains(&extension.to_lowercase().as_str())
     } else {
         false
     }
+}
+
+/// Whether `path` is an XMP sidecar of a file this app would otherwise sort:
+/// its extension is `xmp` (any case), and stripping it leaves the path to a
+/// file with a recognized image/movie extension.
+pub(crate) fn is_sidecar_of_media(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !extension.eq_ignore_ascii_case("xmp") {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(has_image_extension_str)
 }
 
 /// Signatures at the start of image and movie files.
