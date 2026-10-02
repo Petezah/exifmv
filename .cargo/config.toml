@@ -1,0 +1,3 @@
+# Config for Linkstation
+[target.armv5te-unknown-linux-musleabi]
+linker = "/home/alren/arm-gcc/arm-gnu-toolchain-15.3.rel1-x86_64-arm-none-linux-gnueabihf/bin/arm-none-linux-gnueabihf-gcc"

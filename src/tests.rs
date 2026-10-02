@@ -290,14 +290,15 @@ fn remove_source_preserves_different_size() {
     fs::write(&dest, b"longer content").unwrap();
 
     let args = make_test_args(&["--remove-source"]);
-    move_file(&source, &dest, false, args, &MultiProgress::new()).unwrap();
+    let moved =
+        move_file(&source, &dest, false, args, &MultiProgress::new()).unwrap();
 
-    // Both should be preserved when sizes differ.
-    assert!(
-        source.exists(),
-        "Source should be preserved (size mismatch)"
-    );
-    assert!(dest.exists(), "Destination should be preserved");
+    // Different files never clobber each other; the source is moved aside
+    // under a unique name.
+    assert!(!source.exists(), "Source should have been moved");
+    assert_eq!(moved, tmp.path().join("dest_1.jpg"));
+    assert_eq!(fs::read(&dest).unwrap(), b"longer content");
+    assert_eq!(fs::read(&moved).unwrap(), b"short");
 }
 
 #[test]
@@ -346,12 +347,13 @@ fn different_size_preserves_both() {
     fs::write(&dest, b"BB").unwrap();
 
     let args = make_test_args(&[]);
-    move_file(&source, &dest, false, args, &MultiProgress::new()).unwrap();
+    let moved =
+        move_file(&source, &dest, false, args, &MultiProgress::new()).unwrap();
 
-    assert!(source.exists(), "Source preserved (size mismatch)");
-    assert!(dest.exists(), "Dest preserved");
-    assert_eq!(fs::read(&source).unwrap(), b"A");
-    assert_eq!(fs::read(&dest).unwrap(), b"BB");
+    assert!(!source.exists(), "Source moved aside");
+    assert_eq!(moved, tmp.path().join("dest_1.jpg"));
+    assert_eq!(fs::read(&dest).unwrap(), b"BB", "Existing dest untouched");
+    assert_eq!(fs::read(&moved).unwrap(), b"A");
 }
 
 // =============================================================================
@@ -455,6 +457,43 @@ fn move_image_respects_custom_template() {
     .unwrap();
 
     let expected = dest_dir.join("2024-12-25_photo.jpg");
+    assert!(
+        expected.exists(),
+        "File should be at {}",
+        expected.display()
+    );
+}
+
+#[test]
+fn move_image_album_from_folder() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("2011-07-14--Iceland").join("Originals");
+    let dest_dir = tmp.path().join("dest");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&dest_dir).unwrap();
+
+    let source_file = source_dir.join("photo.jpg");
+    create_test_jpeg(&source_file, "2011:07:14 10:00:00");
+
+    let template =
+        Template::parse("{year}-{month}-{day} {album}/{filename}.{extension}")
+            .unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    let args = make_test_args(&[]);
+
+    move_image(
+        &source_file,
+        &dest_dir,
+        &time_offset,
+        &template,
+        false,
+        false,
+        args,
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    let expected = dest_dir.join("2011-07-14 Iceland").join("photo.jpg");
     assert!(
         expected.exists(),
         "File should be at {}",
@@ -771,6 +810,7 @@ fn template_expand_with_all_fields() {
         lens: None,
         iso: None,
         focal_length: None,
+        album: None,
     };
 
     let result = template.expand(&ctx);
@@ -796,6 +836,7 @@ fn template_expand_optional_fields_fallback() {
         lens: None,
         iso: None,
         focal_length: None,
+        album: None,
     };
 
     let result = template.expand(&ctx);
@@ -845,13 +886,15 @@ fn checksum_detects_different_content_same_size() {
     fs::write(&dest, b"BBBBBBBBB").unwrap();
 
     let args = make_test_args(&["--remove-source", "--checksum"]);
-    move_file(&source, &dest, true, args, &MultiProgress::new()).unwrap();
+    let moved =
+        move_file(&source, &dest, true, args, &MultiProgress::new()).unwrap();
 
-    // With checksum: source is preserved because content differs.
-    assert!(source.exists(), "Source preserved (checksum differs)");
-    assert!(dest.exists(), "Dest preserved");
-    assert_eq!(fs::read(&source).unwrap(), b"AAAAAAAAA");
+    // With checksum: the content differs, so the source gets a unique name
+    // instead of being discarded as a duplicate.
+    assert!(!source.exists(), "Source moved aside");
+    assert_eq!(moved, tmp.path().join("dest_1.jpg"));
     assert_eq!(fs::read(&dest).unwrap(), b"BBBBBBBBB");
+    assert_eq!(fs::read(&moved).unwrap(), b"AAAAAAAAA");
 }
 
 #[test]
@@ -892,4 +935,274 @@ fn checksum_skips_without_remove_source() {
     // Both preserved - just skipped.
     assert!(source.exists(), "Source preserved");
     assert!(dest.exists(), "Dest preserved");
+}
+
+// =============================================================================
+// Filename Collisions
+// =============================================================================
+
+#[test]
+fn collision_numbers_successive_files() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("dest.jpg");
+    fs::write(&dest, b"occupied").unwrap();
+
+    // Three distinct files (distinct sizes) all aimed at the same name.
+    for (i, content) in [&b"a"[..], &b"bb"[..], &b"ccc"[..]].iter().enumerate()
+    {
+        let source = tmp.path().join(format!("source{}.jpg", i));
+        fs::write(&source, content).unwrap();
+
+        let moved = move_file(
+            &source,
+            &dest,
+            true,
+            make_test_args(&[]),
+            &MultiProgress::new(),
+        )
+        .unwrap();
+
+        assert_eq!(moved, tmp.path().join(format!("dest_{}.jpg", i + 1)));
+        assert_eq!(&fs::read(&moved).unwrap()[..], *content);
+    }
+
+    assert_eq!(fs::read(&dest).unwrap(), b"occupied", "Original untouched");
+}
+
+#[test]
+fn collision_reuses_existing_duplicate_instead_of_numbering() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("dest.jpg");
+    let numbered = tmp.path().join("dest_1.jpg");
+    let source = tmp.path().join("source.jpg");
+
+    fs::write(&dest, b"different").unwrap();
+    fs::write(&numbered, b"IDENTICAL").unwrap();
+    fs::write(&source, b"IDENTICAL").unwrap();
+
+    let args = make_test_args(&["--checksum", "--remove-source"]);
+    let moved =
+        move_file(&source, &dest, true, args, &MultiProgress::new()).unwrap();
+
+    // The source matches an already-numbered copy, so it is recognised as a
+    // duplicate rather than landing at dest_2.jpg.
+    assert_eq!(moved, numbered);
+    assert!(!source.exists(), "Duplicate source removed");
+    assert!(!tmp.path().join("dest_2.jpg").exists(), "No extra copy");
+}
+
+#[test]
+fn collision_leaves_no_placeholder_in_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("dest.jpg");
+    let source = tmp.path().join("source.jpg");
+    fs::write(&dest, b"different").unwrap();
+    fs::write(&source, b"a").unwrap();
+
+    let args = make_test_args(&["--dry-run"]);
+    let moved =
+        move_file(&source, &dest, true, args, &MultiProgress::new()).unwrap();
+
+    assert_eq!(moved, tmp.path().join("dest_1.jpg"));
+    assert!(source.exists(), "Source untouched (dry run)");
+    assert!(!moved.exists(), "Nothing created (dry run)");
+}
+
+#[test]
+fn collision_does_not_consume_the_source_itself() {
+    // Source already sits at the name the numbering would pick.
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("dest.jpg");
+    let source = tmp.path().join("dest_1.jpg");
+    fs::write(&dest, b"different").unwrap();
+    fs::write(&source, b"mine").unwrap();
+
+    let args = make_test_args(&["--checksum", "--remove-source"]);
+    let moved =
+        move_file(&source, &dest, true, args, &MultiProgress::new()).unwrap();
+
+    assert_eq!(moved, source);
+    assert!(source.exists(), "Source must not be deleted as its own dup");
+    assert_eq!(fs::read(&source).unwrap(), b"mine");
+}
+
+#[test]
+fn collision_sidecar_follows_renamed_image() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    let dest_dir = tmp.path().join("dst");
+    fs::create_dir_all(&source_dir).unwrap();
+
+    let source = source_dir.join("IMG_0001.jpg");
+    create_test_jpeg(&source, "2023:08:21 14:30:45");
+    fs::write(source_dir.join("IMG_0001.jpg.xmp"), b"sidecar").unwrap();
+
+    // Occupy the name the image would take, with different content.
+    let occupied = dest_dir.join("2023/08/21/IMG_0001.jpg");
+    fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+    fs::write(&occupied, b"someone else's photo").unwrap();
+
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    move_image(
+        &source,
+        &dest_dir,
+        &NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        &template,
+        false,
+        true,
+        make_test_args(&["--checksum"]),
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    let renamed = dest_dir.join("2023/08/21/IMG_0001_1.jpg");
+    assert!(renamed.exists(), "Image moved under a unique name");
+    let sidecar = dest_dir.join("2023/08/21/IMG_0001_1.jpg.xmp");
+    assert!(sidecar.exists(), "Sidecar follows the renamed image");
+    assert_eq!(fs::read(&sidecar).unwrap(), b"sidecar");
+    assert_eq!(fs::read(&occupied).unwrap(), b"someone else's photo");
+}
+
+#[test]
+fn dry_run_numbers_collisions_within_the_run() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("dest.jpg");
+    fs::write(&dest, b"occupied").unwrap();
+
+    // Three distinct files aimed at one taken name. Nothing is moved, so
+    // each must still be told apart from the names its predecessors claimed.
+    let mut predicted = Vec::new();
+    for (i, content) in [&b"a"[..], &b"bb"[..], &b"ccc"[..]].iter().enumerate()
+    {
+        let source = tmp.path().join(format!("dry{}.jpg", i));
+        fs::write(&source, content).unwrap();
+
+        let moved = move_file(
+            &source,
+            &dest,
+            true,
+            make_test_args(&["--dry-run"]),
+            &MultiProgress::new(),
+        )
+        .unwrap();
+
+        assert!(source.exists(), "Dry run must not move anything");
+        assert!(!moved.exists(), "Dry run must not create anything");
+        predicted.push(moved);
+    }
+
+    assert_eq!(
+        predicted,
+        vec![
+            tmp.path().join("dest_1.jpg"),
+            tmp.path().join("dest_2.jpg"),
+            tmp.path().join("dest_3.jpg"),
+        ]
+    );
+}
+
+#[test]
+fn dry_run_detects_duplicates_within_the_run() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("dupdest.jpg");
+    let first = tmp.path().join("dupfirst.jpg");
+    let second = tmp.path().join("dupsecond.jpg");
+
+    fs::write(&first, b"IDENTICAL").unwrap();
+    fs::write(&second, b"IDENTICAL").unwrap();
+
+    let first_target = move_file(
+        &first,
+        &dest,
+        true,
+        make_test_args(&["--dry-run"]),
+        &MultiProgress::new(),
+    )
+    .unwrap();
+    let second_target = move_file(
+        &second,
+        &dest,
+        true,
+        make_test_args(&["--dry-run"]),
+        &MultiProgress::new(),
+    )
+    .unwrap();
+
+    // The second is a duplicate of the first, so it claims no new name.
+    assert_eq!(first_target, dest);
+    assert_eq!(second_target, dest);
+}
+
+#[test]
+fn parallel_collisions_are_resolved_once_each() {
+    use std::thread;
+
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("par.jpg");
+
+    // Four distinct files and four copies of one of them, all racing for the
+    // same destination name.
+    let sources: Vec<_> = ["a", "bb", "ccc", "dddd", "same", "same", "same"]
+        .iter()
+        .enumerate()
+        .map(|(i, content)| {
+            let source = tmp.path().join(format!("par_src{}.jpg", i));
+            fs::write(&source, content).unwrap();
+            source
+        })
+        .collect();
+
+    thread::scope(|scope| {
+        for source in &sources {
+            let dest = dest.clone();
+            scope.spawn(move || {
+                move_file(
+                    source,
+                    &dest,
+                    true,
+                    make_test_args(&[]),
+                    &MultiProgress::new(),
+                )
+                .unwrap();
+            });
+        }
+    });
+
+    let mut landed: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("par.") || name.starts_with("par_"))
+        .filter(|name| !name.starts_with("par_src"))
+        .collect();
+    landed.sort();
+
+    // The three identical files collapse into one; no empty placeholder is
+    // left behind by the ones that turned out to be duplicates.
+    assert_eq!(
+        landed,
+        vec![
+            "par.jpg",
+            "par_1.jpg",
+            "par_2.jpg",
+            "par_3.jpg",
+            "par_4.jpg"
+        ],
+        "Five distinct contents should land under five names"
+    );
+    let mut contents: Vec<_> = landed
+        .iter()
+        .map(|name| fs::read(tmp.path().join(name)).unwrap())
+        .collect();
+    contents.sort();
+    assert_eq!(
+        contents,
+        vec![
+            b"a".to_vec(),
+            b"bb".to_vec(),
+            b"ccc".to_vec(),
+            b"dddd".to_vec(),
+            b"same".to_vec(),
+        ]
+    );
 }

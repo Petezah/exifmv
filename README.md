@@ -14,7 +14,13 @@ The folder hierarchy is configurable via a template string
 
 Available template variables: `year`, `month`, `day`, `hour`, `minute`,
 `second`, `filename`, `extension`, `camera_make`, `camera_model`, `lens`,
-`iso`, `focal_length`.
+`iso`, `focal_length`, `album`.
+
+`album` is taken from the image's folder name, for libraries that encode
+events in the path, like old iPhoto exports: an image in
+`2011-07-14--Iceland/Originals` gets the album `Iceland`. Container folders
+(`Originals`, `Modified`, `Masters`, …) and purely numeric/date folders
+(`2011`) are skipped, and a leading `YYYY-MM-DD` date is stripped.
 
 Run `exifmv --help` for full variable descriptions and examples.
 
@@ -47,6 +53,24 @@ location on most operating systems.
 Before doing any deletion or moving-to-trash `exifmv` checks that the file
 size matches. Use `--checksum` to verify file contents instead, eliminating
 false positives from same-size different-content files.
+
+## Name Collisions
+
+When two different photos would land on the same destination name, the second
+one is moved aside as `IMG_1234_1.jpg`, `IMG_1234_2.jpg` and so on; an existing
+file is never overwritten. A source that matches a file already at any of those
+names is treated as a duplicate instead, so re-running `exifmv` over the same
+photos does not pile up extra copies. XMP sidecars follow the name their image
+ended up with.
+
+Note that "different" is judged by file size unless `--checksum` is given, so
+same-size different-content photos are still taken for duplicates by default.
+
+`--dry-run` predicts these names: it keeps track of the names it hands out, so
+colliding files are reported under the names a real run would give them, and a
+photo matching one already accounted for is reported as a duplicate. Files are
+processed in parallel, so which photo gets which number can differ between
+runs; the set of names does not.
 
 ## Configuration File
 

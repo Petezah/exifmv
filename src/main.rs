@@ -10,7 +10,13 @@
 //!
 //! Available template variables: `year`, `month`, `day`, `hour`, `minute`,
 //! `second`, `filename`, `extension`, `camera_make`, `camera_model`, `lens`,
-//! `iso`, `focal_length`.
+//! `iso`, `focal_length`, `album`.
+//!
+//! `album` is taken from the image's folder name, for libraries that encode
+//! events in the path, like old iPhoto exports: an image in
+//! `2011-07-14--Iceland/Originals` gets the album `Iceland`. Container folders
+//! (`Originals`, `Modified`, `Masters`, …) and purely numeric/date folders
+//! (`2011`) are skipped, and a leading `YYYY-MM-DD` date is stripped.
 //!
 //! Run `exifmv --help` for full variable descriptions and examples.
 //!
@@ -43,6 +49,25 @@
 //! Before doing any deletion or moving-to-trash `exifmv` checks that the file
 //! size matches. Use `--checksum` to verify file contents instead, eliminating
 //! false positives from same-size different-content files.
+//!
+//! # Name Collisions
+//!
+//! When two different photos would land on the same destination name, the
+//! second one is moved aside as `IMG_1234_1.jpg`, `IMG_1234_2.jpg` and so on;
+//! an existing file is never overwritten. A source that matches a file already
+//! at any of those names is treated as a duplicate instead, so re-running
+//! `exifmv` over the same photos does not pile up extra copies. XMP sidecars
+//! follow the name their image ended up with.
+//!
+//! Note that "different" is judged by file size unless `--checksum` is given,
+//! so same-size different-content photos are still taken for duplicates by
+//! default.
+//!
+//! `--dry-run` predicts these names: it keeps track of the names it hands
+//! out, so colliding files are reported under the names a real run would give
+//! them, and a photo matching one already accounted for is reported as a
+//! duplicate. Files are processed in parallel, so which photo gets which
+//! number can differ between runs; the set of names does not.
 //!
 //! # Configuration File
 //!
@@ -228,6 +253,11 @@ Available variables:\n\
     {lens}          ➞  FE-35mm-F1.4-GM\n\
     {iso}           ➞  400\n\
     {focal_length}  ➞  35\n\
+  Path (from the source folder, 'unknown' if none found):\n\
+    {album}         ➞  Iceland  (nearest folder name, skipping\n\
+                                 Originals/Modified/… and date-only\n\
+                                 folders; leading YYYY-MM-DD stripped:\n\
+                                 2011-07-14--Iceland/Originals ➞ Iceland)\n\
 \n\
 Examples:\n\
   Default:\n\
@@ -238,7 +268,10 @@ Examples:\n\
     ➞  Sony/ILCE-7M3/2024-08-15/IMG_1234.arw\n\
   Flat with timestamp:\n\
     {year}{month}{day}_{hour}{minute}{second}_{filename}.{extension}\n\
-    ➞  20240815_143000_IMG_1234.arw"),
+    ➞  20240815_143000_IMG_1234.arw\n\
+  By date and album:\n\
+    {year}/{year}-{month}-{day} {album}/{filename}.{extension}\n\
+    ➞  2011/2011-07-14 Iceland/IMG_1234.jpg"),
         )
         .arg(
             Arg::new("config")
@@ -318,17 +351,24 @@ Examples:\n\
     let dest_dir =
         PathBuf::from(args.get_one::<String>("DESTINATION").unwrap());
 
+    // Note: `contents_first(true)` must not be combined with `filter_entry`;
+    // walkdir ends the iteration early when a directory is filtered out,
+    // silently skipping everything after it.
     let files = WalkDir::new(source)
-        .contents_first(true)
         .max_depth(if recursive { usize::MAX } else { 1 })
         .follow_links(dereference)
         .sort_by(|a, b| a.file_name().cmp(b.file_name()))
         .into_iter()
         .filter_entry(is_not_hidden)
-        .filter_map(|e| {
-            e.ok()
-                .filter(|e| e.file_type().is_file() && has_image_extension(e))
+        .filter_map(|e| match e {
+            Ok(e) => Some(e),
+            // Report unreadable entries but keep walking the rest of the tree.
+            Err(e) => {
+                warn!("{:#}", e);
+                None
+            }
         })
+        .filter(|e| e.file_type().is_file() && has_image_extension(e))
         .collect::<Vec<_>>();
 
     let args = Arc::new(args);
@@ -351,7 +391,7 @@ Examples:\n\
             match result {
                 Ok(()) => None,
                 Err(e) => {
-                    warn!("{}", e);
+                    warn!("{:#}", e);
                     Some(e)
                 }
             }
@@ -394,7 +434,7 @@ pub(crate) fn move_image(
         .read_from_container(&mut std::io::BufReader::new(&source_file_handle))
         .with_context(|| {
             format!(
-                "Unable to read EXIF metadata of '{}'.",
+                "Unable to read EXIF metadata of '{}'",
                 source_file.display()
             )
         })?;
@@ -471,11 +511,18 @@ pub(crate) fn move_image(
         iso: exif_string(&meta_data, Tag::PhotographicSensitivity),
         focal_length: exif_string(&meta_data, Tag::FocalLength)
             .map(|s| s.trim_end_matches("-mm").to_string()),
+        album: source_file.parent().and_then(album_from_path).map(|album| {
+            if make_lowercase {
+                album.to_lowercase()
+            } else {
+                album
+            }
+        }),
     };
 
     // Expand template to get relative path.
     let relative_path = template.expand(&ctx);
-    let mut dest_file = dest_dir.join(&relative_path);
+    let dest_file = dest_dir.join(&relative_path);
 
     // Create parent directories.
     if let Some(parent) = dest_file.parent()
@@ -492,7 +539,10 @@ pub(crate) fn move_image(
         })?;
     }
 
-    move_file(source_file, &dest_file, checksum, args.clone(), &multi)?;
+    // The image may have been given a unique name to avoid clobbering a
+    // different file; sidecars follow whatever name it ended up with.
+    let mut dest_file =
+        move_file(source_file, &dest_file, checksum, args.clone(), &multi)?;
 
     // Move possible sidecar files.
     let source_xmp_file = source_file.to_path_buf();
