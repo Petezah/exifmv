@@ -4,8 +4,10 @@
 //! temp directory, ensuring no artifacts are left in the source tree.
 
 use crate::{
-    Template, TemplateContext, config::DateSource, day_wrap, move_image,
-    util::move_file,
+    Template, TemplateContext, collect_files,
+    config::DateSource,
+    day_wrap, move_image, move_unclassified, relative_to_source,
+    util::{is_sidecar_of_media, move_file},
 };
 use chrono::NaiveTime;
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -380,7 +382,9 @@ fn move_image_creates_date_hierarchy() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -418,7 +422,9 @@ fn move_image_missing_exif_fails() {
 
     let result = move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -450,7 +456,9 @@ fn move_image_respects_custom_template() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -488,7 +496,9 @@ fn move_image_album_from_folder() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -538,7 +548,9 @@ fn move_image_date_from_folders() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -561,6 +573,48 @@ fn move_image_date_from_folders() {
 }
 
 #[test]
+fn move_image_partial_folder_date() {
+    let tmp = TempDir::new().unwrap();
+    let dest_dir = tmp.path().join("dest");
+    fs::create_dir_all(&dest_dir).unwrap();
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+
+    for (folder, clip, expected) in [
+        ("E3 2006", "0164.avi", ["2006", "00", "00", "0164.avi"]),
+        ("July 2012", "0028.mp4", ["2012", "07", "00", "0028.mp4"]),
+    ] {
+        let source_dir = tmp.path().join("iPhoto").join("Current").join(folder);
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_file = source_dir.join(clip);
+        write_fake_movie(&source_file);
+
+        move_image(
+            &source_file,
+            &source_dir,
+            &dest_dir,
+            None,
+            &time_offset,
+            &template,
+            false,
+            false,
+            &[DateSource::Folders],
+            make_test_args(&[]),
+            Arc::new(MultiProgress::new()),
+        )
+        .unwrap();
+
+        let expected = expected.iter().fold(dest_dir.clone(), |p, c| p.join(c));
+        assert!(
+            expected.exists(),
+            "File should be at {}",
+            expected.display()
+        );
+    }
+}
+
+#[test]
 fn move_image_date_from_filename() {
     let tmp = TempDir::new().unwrap();
     let source_dir = tmp.path().join("source");
@@ -580,7 +634,9 @@ fn move_image_date_from_filename() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -618,7 +674,9 @@ fn move_image_rejects_non_media_with_path_date() {
 
     let result = move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -704,7 +762,9 @@ fn move_image_date_source_priority() {
         let dest_dir = TempDir::new().unwrap();
         move_image(
             &source_file,
+            &source_dir,
             dest_dir.path(),
+            None,
             &time_offset,
             &template,
             false,
@@ -753,7 +813,9 @@ fn move_image_lowercase_option() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         true,
@@ -788,7 +850,9 @@ fn move_image_day_wrap_shifts_date() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -828,7 +892,9 @@ fn xmp_sidecar_moves_with_image() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -867,7 +933,9 @@ fn xmp_uppercase_moves_with_image() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         false,
@@ -901,7 +969,9 @@ fn xmp_lowercase_conversion() {
 
     move_image(
         &source_file,
+        &source_dir,
         &dest_dir,
+        None,
         &time_offset,
         &template,
         true,
@@ -1256,7 +1326,9 @@ fn collision_sidecar_follows_renamed_image() {
         Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
     move_image(
         &source,
+        &source_dir,
         &dest_dir,
+        None,
         &NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
         &template,
         false,
@@ -1415,5 +1487,284 @@ fn parallel_collisions_are_resolved_once_each() {
             b"dddd".to_vec(),
             b"same".to_vec(),
         ]
+    );
+}
+
+// =============================================================================
+// --unclassified Tests
+// =============================================================================
+
+#[test]
+fn move_image_without_unclassified_still_errors() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    let dest_dir = tmp.path().join("dst");
+    fs::create_dir_all(&source_dir).unwrap();
+
+    let source_file = source_dir.join("no_exif.jpg");
+    create_jpeg_without_exif(&source_file);
+
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+
+    let result = move_image(
+        &source_file,
+        &source_dir,
+        &dest_dir,
+        None,
+        &time_offset,
+        &template,
+        false,
+        false,
+        &[DateSource::Exif],
+        make_test_args(&[]),
+        Arc::new(MultiProgress::new()),
+    );
+
+    assert!(result.is_err(), "No --unclassified: still an error");
+    assert!(source_file.exists(), "Source should be preserved on error");
+}
+
+#[test]
+fn move_image_routes_unclassifiable_media_preserving_relative_path() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    let dest_dir = tmp.path().join("dst");
+    let unclassified_dir = tmp.path().join("unc");
+    fs::create_dir_all(source_dir.join("a").join("b")).unwrap();
+
+    // No EXIF at all, so `--date-from exif` alone can't place it.
+    let source_file = source_dir.join("a").join("b").join("x.jpg");
+    create_jpeg_without_exif(&source_file);
+    let source_xmp = source_dir.join("a").join("b").join("x.jpg.xmp");
+    fs::write(&source_xmp, b"sidecar").unwrap();
+
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+
+    move_image(
+        &source_file,
+        &source_dir,
+        &dest_dir,
+        Some(&unclassified_dir),
+        &time_offset,
+        &template,
+        false,
+        false,
+        &[DateSource::Exif],
+        make_test_args(&[]),
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    let expected = unclassified_dir.join("a").join("b").join("x.jpg");
+    let expected_xmp = unclassified_dir.join("a").join("b").join("x.jpg.xmp");
+    assert!(
+        expected.exists(),
+        "File should be routed to {}",
+        expected.display()
+    );
+    assert!(expected_xmp.exists(), "XMP sidecar should follow it");
+    assert!(!source_file.exists(), "Source should be moved");
+    assert!(!dest_dir.exists(), "Nothing should land in DESTINATION");
+}
+
+#[test]
+fn move_image_routes_untrusted_path_date() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("2019-03-10");
+    let dest_dir = tmp.path().join("dst");
+    let unclassified_dir = tmp.path().join("unc");
+    fs::create_dir_all(&source_dir).unwrap();
+
+    // Garbage content behind a movie extension: not real media, so its
+    // folder date can't be trusted.
+    let source_file = source_dir.join("not_really_a_movie.mp4");
+    fs::write(&source_file, b"this is not a movie").unwrap();
+
+    let template =
+        Template::parse("{year}/{month}/{day}/{filename}.{extension}").unwrap();
+    let time_offset = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+
+    move_image(
+        &source_file,
+        &source_dir,
+        &dest_dir,
+        Some(&unclassified_dir),
+        &time_offset,
+        &template,
+        false,
+        false,
+        &[DateSource::Folders],
+        make_test_args(&[]),
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    let expected = unclassified_dir.join("not_really_a_movie.mp4");
+    assert!(expected.exists(), "Untrusted-date file should be routed");
+}
+
+// A `{album}` template with no album found in the path is exercised via
+// `require_album_if_needed_only_for_path_dates_using_album` directly rather
+// than through `move_image`: as that test's comment explains, any real
+// file's canonicalized path has *some* named ancestor, so `album_from_path`
+// never actually returns `None` for it in a filesystem-backed test.
+
+#[test]
+fn move_unclassified_preserves_relative_path() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    let unclassified_dir = tmp.path().join("unc");
+    fs::create_dir_all(source_dir.join("misc")).unwrap();
+
+    let source_file = source_dir.join("misc").join("notes.txt");
+    fs::write(&source_file, b"hello").unwrap();
+
+    move_unclassified(
+        &source_file,
+        &source_dir,
+        &unclassified_dir,
+        false,
+        make_test_args(&[]),
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    let expected = unclassified_dir.join("misc").join("notes.txt");
+    assert!(expected.exists());
+    assert!(!source_file.exists());
+}
+
+#[test]
+fn move_unclassified_dry_run_changes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    let unclassified_dir = tmp.path().join("unc");
+    fs::create_dir_all(&source_dir).unwrap();
+
+    let source_file = source_dir.join("notes.txt");
+    fs::write(&source_file, b"hello").unwrap();
+
+    move_unclassified(
+        &source_file,
+        &source_dir,
+        &unclassified_dir,
+        false,
+        make_test_args(&["--dry-run"]),
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    assert!(source_file.exists(), "Dry run should not move the file");
+    assert!(!unclassified_dir.join("notes.txt").exists());
+}
+
+#[test]
+fn move_unclassified_numbers_collisions() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    let unclassified_dir = tmp.path().join("unc");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&unclassified_dir).unwrap();
+
+    let source_file = source_dir.join("notes.txt");
+    fs::write(&source_file, b"mine").unwrap();
+    // A different file already occupies the destination name.
+    fs::write(unclassified_dir.join("notes.txt"), b"someone else's").unwrap();
+
+    move_unclassified(
+        &source_file,
+        &source_dir,
+        &unclassified_dir,
+        false,
+        make_test_args(&[]),
+        Arc::new(MultiProgress::new()),
+    )
+    .unwrap();
+
+    assert!(unclassified_dir.join("notes_1.txt").exists());
+    assert!(!source_file.exists());
+}
+
+#[test]
+fn relative_to_source_falls_back_to_file_name() {
+    let tmp = TempDir::new().unwrap();
+    let source_file = tmp.path().join("single.jpg");
+    fs::write(&source_file, b"x").unwrap();
+
+    // SOURCE is the file itself: no meaningful relative path.
+    assert_eq!(
+        relative_to_source(&source_file, &source_file),
+        Path::new("single.jpg")
+    );
+}
+
+#[test]
+fn is_sidecar_of_media_recognizes_naming_pattern() {
+    assert!(is_sidecar_of_media(Path::new("photo.jpg.xmp")));
+    assert!(is_sidecar_of_media(Path::new("photo.jpg.XMP")));
+    assert!(!is_sidecar_of_media(Path::new("photo.txt.xmp")));
+    assert!(!is_sidecar_of_media(Path::new("notes.txt")));
+    assert!(!is_sidecar_of_media(Path::new("photo.jpg")));
+}
+
+#[test]
+fn collect_files_splits_media_and_other() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    fs::create_dir_all(&source_dir).unwrap();
+
+    fs::write(source_dir.join("photo.jpg"), b"img").unwrap();
+    fs::write(source_dir.join("photo.jpg.xmp"), b"sidecar").unwrap();
+    fs::write(source_dir.join("orphan.xmp"), b"orphan").unwrap();
+    fs::write(source_dir.join("notes.txt"), b"text").unwrap();
+
+    let unclassified_dir = tmp.path().join("unc");
+
+    // With `unclassified` set, "other" picks up everything but the media
+    // file and the sidecar that follows it.
+    let (media, other) =
+        collect_files(&source_dir, true, false, Some(&unclassified_dir));
+    let media_names: Vec<_> = media
+        .iter()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .collect();
+    let other_names: Vec<_> = other
+        .iter()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .collect();
+
+    assert_eq!(media_names, vec!["photo.jpg"]);
+    assert_eq!(other_names, vec!["notes.txt", "orphan.xmp"]);
+
+    // Without `unclassified`, nothing goes into "other".
+    let (_, other_none) = collect_files(&source_dir, true, false, None);
+    assert!(other_none.is_empty());
+}
+
+#[test]
+fn collect_files_skips_unclassified_dir_inside_source() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("src");
+    let unclassified_dir = source_dir.join("unc");
+    fs::create_dir_all(&unclassified_dir).unwrap();
+
+    fs::write(source_dir.join("notes.txt"), b"text").unwrap();
+    fs::write(unclassified_dir.join("already_there.txt"), b"old").unwrap();
+
+    let (_, other) =
+        collect_files(&source_dir, true, false, Some(&unclassified_dir));
+    let other_names: Vec<_> = other
+        .iter()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .collect();
+
+    assert_eq!(
+        other_names,
+        vec!["notes.txt"],
+        "Files already inside the unclassified dir should be left alone"
     );
 }

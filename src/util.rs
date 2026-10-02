@@ -1,5 +1,5 @@
 use crate::*;
-use chrono::{NaiveDate, NaiveTime};
+use chrono::{Datelike, NaiveDate, NaiveTime};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::info;
 use std::{
@@ -57,6 +57,53 @@ pub(crate) fn album_from_path(dir: &Path) -> Option<String> {
     })
 }
 
+/// A date that may be only partly known: a year, perhaps a month, perhaps a
+/// day. Missing parts expand to `00` in destination paths, so such files are
+/// easy to find and fix up later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PathDate {
+    pub year: i32,
+    pub month: Option<u32>,
+    pub day: Option<u32>,
+}
+
+impl PathDate {
+    fn partial(year: i32, month: Option<u32>) -> Self {
+        Self {
+            year,
+            month,
+            day: None,
+        }
+    }
+
+    /// The complete date, if year, month and day are all known.
+    pub(crate) fn full(&self) -> Option<NaiveDate> {
+        NaiveDate::from_ymd_opt(self.year, self.month?, self.day?)
+    }
+}
+
+impl From<NaiveDate> for PathDate {
+    fn from(date: NaiveDate) -> Self {
+        Self {
+            year: date.year(),
+            month: Some(date.month()),
+            day: Some(date.day()),
+        }
+    }
+}
+
+impl std::fmt::Display for PathDate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:04}-{:02}-{:02}",
+            self.year,
+            self.month.unwrap_or(0),
+            self.day.unwrap_or(0)
+        )
+    }
+}
+
 /// Derive a date from the folders an image lives in.
 ///
 /// Only the album folder (see [`album_from_path`]) and the date-only folders
@@ -65,10 +112,15 @@ pub(crate) fn album_from_path(dir: &Path) -> Option<String> {
 /// `Trips/2011/07/14` both yield 2011-07-14, but
 /// `Backups/20190311/Trips/2011` yields nothing. The album folder's own date
 /// wins over date-only folders below it.
-pub(crate) fn date_from_folders(dir: &Path) -> Option<NaiveDate> {
+///
+/// Failing a full date, a year (and month, if any) is used with the rest
+/// left unknown: `E3 2006` yields 2006, `July 2012` and `2012-07 Beach` yield
+/// 2012-07, and `Trips/2019` yields 2019.
+pub(crate) fn date_from_folders(dir: &Path) -> Option<PathDate> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     // Date-only folders below the album folder, nearest first.
     let mut dated = Vec::new();
+    let mut album_folder = None;
     for component in dir.components().rev() {
         let Some(name) = component.as_os_str().to_str() else {
             break;
@@ -82,12 +134,13 @@ pub(crate) fn date_from_folders(dir: &Path) -> Option<NaiveDate> {
         }
         // The album folder, which ends the search.
         if let Some(date) = split_date_prefix(name).map(|(date, _)| date) {
-            return Some(date);
+            return Some(date.into());
         }
+        album_folder = Some(name);
         break;
     }
 
-    dated
+    let full = dated
         .iter()
         .find_map(|name| split_date_prefix(name).map(|(date, _)| date))
         .or_else(|| {
@@ -103,6 +156,99 @@ pub(crate) fn date_from_folders(dir: &Path) -> Option<NaiveDate> {
                 month.parse().ok()?,
                 day.parse().ok()?,
             ])
+        });
+    if let Some(date) = full {
+        return Some(date.into());
+    }
+
+    album_folder
+        .and_then(partial_date_in_name)
+        .or_else(|| partial_date_in_folders(&dated))
+}
+
+/// A year, and a month if one is named, found in a folder name like
+/// `E3 2006`, `July 2012` or `2012-07 Beach`.
+fn partial_date_in_name(name: &str) -> Option<PathDate> {
+    let bytes = name.as_bytes();
+    let (year, end) = (0..bytes.len()).find_map(|start| {
+        let run = &bytes[start..];
+        // A year is a run of exactly four digits.
+        if !run[0].is_ascii_digit()
+            || (start > 0 && bytes[start - 1].is_ascii_digit())
+            || run.len() < 4
+            || !run[..4].iter().all(u8::is_ascii_digit)
+            || run.get(4).is_some_and(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let year: u32 = name[start..start + 4].parse().ok()?;
+        (1900..=2100)
+            .contains(&year)
+            .then_some((year as i32, start + 4))
+    })?;
+
+    let month = month_from_words(name).or_else(|| {
+        // `YYYY-MM`, `YYYY_MM` or `YYYY.MM` right after the year.
+        let rest = name[end..].strip_prefix(['-', '_', '.'])?.as_bytes();
+        if rest.len() < 2
+            || !rest[..2].iter().all(u8::is_ascii_digit)
+            || rest.get(2).is_some_and(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        month_number(std::str::from_utf8(&rest[..2]).ok()?)
+    });
+    Some(PathDate::partial(year, month))
+}
+
+/// A year, and a month if the folder just below it is one, from date-only
+/// folders (nearest first) like `2019/07` or `2019`.
+fn partial_date_in_folders(dated: &[&str]) -> Option<PathDate> {
+    dated.iter().enumerate().find_map(|(i, name)| {
+        let mut date = partial_date_in_name(name)?;
+        if date.month.is_none() && name.len() == 4 {
+            date.month = i.checked_sub(1).and_then(|j| month_number(dated[j]));
+        }
+        Some(date)
+    })
+}
+
+/// A month from a one or two digit number.
+fn month_number(s: &str) -> Option<u32> {
+    if s.is_empty() || s.len() > 2 {
+        return None;
+    }
+    s.parse().ok().filter(|m| (1..=12).contains(m))
+}
+
+/// The first month named, in full or abbreviated, as a word of `name`.
+fn month_from_words(name: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    name.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .find_map(|word| {
+            let word = word.to_ascii_lowercase();
+            MONTHS
+                .iter()
+                .position(|month| {
+                    *month == word
+                        || (month.starts_with(&word)
+                            && (3..=4).contains(&word.len()))
+                })
+                .map(|i| i as u32 + 1)
         })
 }
 
@@ -209,13 +355,32 @@ fn strip_date_prefix(name: &str) -> &str {
 }
 
 pub(crate) fn has_image_extension(entry: &walkdir::DirEntry) -> bool {
-    if let Some(extension) = PathBuf::from(entry.file_name()).extension()
+    has_image_extension_str(entry.file_name().to_str().unwrap_or(""))
+}
+
+fn has_image_extension_str(file_name: &str) -> bool {
+    if let Some(extension) = Path::new(file_name).extension()
         && let Some(extension) = extension.to_str()
     {
         EXTENSIONS.contains(&extension.to_lowercase().as_str())
     } else {
         false
     }
+}
+
+/// Whether `path` is an XMP sidecar of a file this app would otherwise sort:
+/// its extension is `xmp` (any case), and stripping it leaves the path to a
+/// file with a recognized image/movie extension.
+pub(crate) fn is_sidecar_of_media(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !extension.eq_ignore_ascii_case("xmp") {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(has_image_extension_str)
 }
 
 /// Signatures at the start of image and movie files.
@@ -670,8 +835,16 @@ mod tests {
         assert_eq!(album("Album-0").as_deref(), Some("Album-0"));
     }
 
-    fn folder_date(path: &str) -> Option<NaiveDate> {
+    fn folder_date(path: &str) -> Option<PathDate> {
         date_from_folders(Path::new(path))
+    }
+
+    fn ymd(year: i32, month: u32, day: u32) -> Option<PathDate> {
+        NaiveDate::from_ymd_opt(year, month, day).map(PathDate::from)
+    }
+
+    fn partial(year: i32, month: Option<u32>) -> Option<PathDate> {
+        Some(PathDate::partial(year, month))
     }
 
     #[test]
@@ -684,38 +857,79 @@ mod tests {
             ("2013-10-21--Garden", (2013, 10, 21)),
         ] {
             let (y, m, d) = expected;
-            assert_eq!(
-                folder_date(&format!("{base}/{dir}")),
-                NaiveDate::from_ymd_opt(y, m, d)
-            );
+            assert_eq!(folder_date(&format!("{base}/{dir}")), ymd(y, m, d));
         }
     }
 
     #[test]
     fn folder_date_from_nested_ymd() {
-        assert_eq!(
-            folder_date("Trips/2019/07/14"),
-            NaiveDate::from_ymd_opt(2019, 7, 14)
-        );
+        assert_eq!(folder_date("Trips/2019/07/14"), ymd(2019, 7, 14));
     }
 
     #[test]
     fn folder_date_from_full_date_folder() {
-        assert_eq!(
-            folder_date("Trips/2019-03-10/Originals"),
-            NaiveDate::from_ymd_opt(2019, 3, 10)
-        );
+        assert_eq!(folder_date("Trips/2019-03-10/Originals"), ymd(2019, 3, 10));
     }
 
     #[test]
-    fn folder_date_none_without_full_date() {
-        // Only a year: no month/day to derive a date from.
-        assert_eq!(folder_date("Trips/2019"), None);
+    fn folder_date_none_without_year() {
         // Album folder reached with no date prefix, and nothing dated below.
         assert_eq!(
             folder_date("Backups_Old/201903110930/Staging/random"),
             None
         );
+        // A backup's date above the album folder is never used.
+        assert_eq!(folder_date("Backups/20190311/Trips/Iceland"), None);
+    }
+
+    #[test]
+    fn folder_date_year_only() {
+        let base = "Backups_Old/201502041445/StagedBackup/2015-01-24/\
+                    iPhoto/Current";
+        assert_eq!(
+            folder_date(&format!("{base}/E3 2006")),
+            partial(2006, None)
+        );
+        assert_eq!(folder_date("Trips/2019"), partial(2019, None));
+    }
+
+    #[test]
+    fn folder_date_year_and_month() {
+        let base = "Backups_Old/201502041445/StagedBackup/2015-01-24/\
+                    iPhoto/Current";
+        assert_eq!(
+            folder_date(&format!("{base}/July 2012")),
+            partial(2012, Some(7))
+        );
+        assert_eq!(folder_date("Sept 2014 Trip"), partial(2014, Some(9)));
+        assert_eq!(
+            folder_date("Trip to Paris, dec 2010"),
+            partial(2010, Some(12))
+        );
+        assert_eq!(folder_date("2012-07 Beach"), partial(2012, Some(7)));
+        assert_eq!(folder_date("2012_7 Beach"), partial(2012, None));
+        assert_eq!(folder_date("Trips/2019/07"), partial(2019, Some(7)));
+    }
+
+    #[test]
+    fn folder_date_partial_rejects_non_years() {
+        assert_eq!(folder_date("Album201202"), None);
+        assert_eq!(folder_date("Trip 3000"), None);
+        assert_eq!(folder_date("Trip 20123"), None);
+        assert_eq!(folder_date("Trips/123456789012"), None);
+    }
+
+    #[test]
+    fn folder_date_full_beats_partial() {
+        assert_eq!(folder_date("2011-07-14--Iceland 2012"), ymd(2011, 7, 14));
+        assert_eq!(folder_date("July 2012/2013-02-03"), ymd(2013, 2, 3));
+    }
+
+    #[test]
+    fn path_date_display_pads_unknown_parts() {
+        assert_eq!(PathDate::partial(2006, None).to_string(), "2006-00-00");
+        assert_eq!(PathDate::partial(2012, Some(7)).to_string(), "2012-07-00");
+        assert_eq!(PathDate::partial(2012, Some(7)).full(), None);
     }
 
     #[test]
