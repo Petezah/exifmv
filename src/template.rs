@@ -180,6 +180,13 @@ impl Template {
         })
     }
 
+    /// Whether the template references the variable `name`.
+    pub fn uses(&self, name: &str) -> bool {
+        self.segments.iter().any(
+            |segment| matches!(segment, Segment::Variable { name: n, .. } if n == name),
+        )
+    }
+
     /// Validate that all variables in the template are known.
     pub fn validate(&self) -> Result<()> {
         let known: HashSet<&str> = KNOWN_VARIABLES.iter().copied().collect();
@@ -319,6 +326,13 @@ mod tests {
         assert_eq!(t.expand(&ctx), "Beach Weekend/IMG_1234");
         let ctx = TemplateContext::default();
         assert_eq!(t.expand(&ctx), "unknown/");
+    }
+
+    #[test]
+    fn template_uses_variable() {
+        let t = Template::parse("{year}/{album}/{filename}").unwrap();
+        assert!(t.uses("album"));
+        assert!(!t.uses("camera_make"));
     }
 
     #[test]

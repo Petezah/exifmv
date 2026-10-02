@@ -20,6 +20,22 @@
 //!
 //! Run `exifmv --help` for full variable descriptions and examples.
 //!
+//! # Files Without EXIF
+//!
+//! Movies, and images whose EXIF has been stripped, have no `DateTimeOriginal`
+//! to sort by. `--date-from` names sources to try instead, in priority order:
+//! `filename` (a date, and optionally a time, encoded in the file name, e.g.
+//! `IMG_20190310_123456.jpg`) and `folders` (a date encoded in the names of
+//! the containing folders, as for `album` above). `exif` is implied first if
+//! not listed, so `--date-from folders` tries EXIF, then folder dates; listing
+//! `exif` explicitly lets a path date override it, e.g.
+//! `--date-from folders,exif`.
+//!
+//! A `filename` or `folders` date is only trusted for a file whose contents
+//! are recognized as an image or movie, checked independently of its
+//! extension. If the destination template uses `{album}` and none can be
+//! found, the file is skipped rather than filed under `unknown`.
+//!
 //! # Example
 //!
 //! If you have an image shot on _Aug. 15 2020_ named
@@ -83,6 +99,7 @@
 //! halt-on-errors = false
 //! dereference = false
 //! checksum = false
+//! date-from = ["folders", "filename"]
 //! ```
 //!
 //! CLI arguments override config file settings.
@@ -125,7 +142,7 @@ mod template;
 mod tests;
 mod util;
 
-use config::Config as AppConfig;
+use config::{Config as AppConfig, DateSource};
 use template::{Template, TemplateContext};
 use util::*;
 
@@ -213,6 +230,31 @@ fn main() -> Result<()> {
                 .long("checksum")
                 .help("Verify file contents for duplicate detection")
                 .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("date-from")
+                .long("date-from")
+                .value_name("SOURCE[,SOURCE...]")
+                .value_delimiter(',')
+                .value_parser(["exif", "filename", "folders"])
+                .help("Where to look for a file's date, in priority order")
+                .long_help("\
+Sources to try a file's date from, in priority order, for files whose EXIF\n\
+DateTime is missing or unreadable (e.g. movies, or stripped images).\n\
+\n\
+  exif      DateTimeOriginal (implied first if not listed)\n\
+  filename  a date, and optionally a time, encoded in the file name\n\
+  folders   a date encoded in the names of the folders the file is in\n\
+\n\
+A `filename` or `folders` date is trusted only for a file whose contents are\n\
+recognised as an image or movie, checked independently of the file's\n\
+extension. A `folders` date without a time expands {hour}/{minute}/{second}\n\
+as 00.\n\
+\n\
+Examples:\n\
+  --date-from folders            ➞  try EXIF, then folder dates\n\
+  --date-from filename,folders   ➞  try EXIF, then filename, then folders\n\
+  --date-from folders,exif       ➞  trust a folder date over EXIF"),
         )
         /*.arg(
             Arg::new("cleanup")
@@ -347,6 +389,17 @@ Examples:\n\
     let template = Template::parse(format_str)?;
     template.validate()?;
 
+    // A CLI --date-from replaces the config value entirely.
+    let date_sources = config::date_sources(
+        args.get_many::<String>("date-from")
+            .map(|values| {
+                values
+                    .map(|v| v.parse().unwrap())
+                    .collect::<Vec<DateSource>>()
+            })
+            .unwrap_or_else(|| app_config.date_from.unwrap_or_default()),
+    );
+
     let source: &String = args.get_one("SOURCE").unwrap();
     let dest_dir =
         PathBuf::from(args.get_one::<String>("DESTINATION").unwrap());
@@ -385,6 +438,7 @@ Examples:\n\
                 &template,
                 make_lowercase,
                 checksum,
+                &date_sources,
                 args.clone(),
                 multi.clone(),
             );
@@ -413,6 +467,44 @@ fn is_not_hidden(entry: &DirEntry) -> bool {
         .unwrap_or(false)
 }
 
+/// A file's date, found from one of the configured [`DateSource`]s.
+struct FoundDate {
+    date: NaiveDate,
+    /// `None` when the source (currently only `folders`) can't supply a time.
+    time: Option<(u32, u32, u32)>,
+    source: DateSource,
+}
+
+/// Try `source_file`'s EXIF `DateTimeOriginal`.
+fn date_from_exif(meta_data: Option<&exif::Exif>) -> Option<FoundDate> {
+    let time_stamp = meta_data
+        .and_then(|meta| {
+            meta.get_field(Tag::DateTimeOriginal, exif::In::PRIMARY)
+        })
+        .and_then(|f| match f.value {
+            Value::Ascii(ref vec) if !vec.is_empty() => {
+                DateTime::from_ascii(&vec[0]).ok()
+            }
+            _ => None,
+        })?;
+
+    let date = NaiveDate::from_ymd_opt(
+        time_stamp.year as i32,
+        time_stamp.month as u32,
+        time_stamp.day as u32,
+    )?;
+
+    Some(FoundDate {
+        date,
+        time: Some((
+            time_stamp.hour as u32,
+            time_stamp.minute as u32,
+            time_stamp.second as u32,
+        )),
+        source: DateSource::Exif,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn move_image(
     source_file: &Path,
@@ -421,6 +513,7 @@ pub(crate) fn move_image(
     template: &Template,
     make_lowercase: bool,
     checksum: bool,
+    date_sources: &[DateSource],
     args: Arc<ArgMatches>,
     multi: Arc<MultiProgress>,
 ) -> Result<()> {
@@ -430,52 +523,11 @@ pub(crate) fn move_image(
         })?;
 
     let exif_reader = exif::Reader::new();
+    // A file this crate can't parse as EXIF at all (e.g. a movie) is not an
+    // error here; it just means EXIF doesn't supply a date.
     let meta_data = exif_reader
         .read_from_container(&mut std::io::BufReader::new(&source_file_handle))
-        .with_context(|| {
-            format!(
-                "Unable to read EXIF metadata of '{}'",
-                source_file.display()
-            )
-        })?;
-
-    let time_stamp = meta_data
-        .get_field(Tag::DateTimeOriginal, exif::In::PRIMARY)
-        .and_then(|f| match f.value {
-            Value::Ascii(ref vec) if !vec.is_empty() => {
-                DateTime::from_ascii(&vec[0]).ok()
-            }
-            _ => None,
-        })
-        .with_context(|| {
-            format!(
-                "Timestamp metadata missing in '{}'.",
-                source_file.display()
-            )
-        })?;
-
-    let date = NaiveDate::from_ymd_opt(
-        time_stamp.year as i32,
-        time_stamp.month as u32,
-        time_stamp.day as u32,
-    )
-    .with_context(|| {
-        format!(
-            "Invalid date {}-{}-{} in '{}'.",
-            time_stamp.year,
-            time_stamp.month,
-            time_stamp.day,
-            source_file.display()
-        )
-    })?;
-
-    let date = if day_wrap(&time_stamp, time_offset) == 1 {
-        date.checked_add_days(Days::new(1)).with_context(|| {
-            format!("Date overflow for '{}'.", source_file.display())
-        })?
-    } else {
-        date
-    };
+        .ok();
 
     // Extract filename and extension.
     let file_stem = source_file
@@ -487,14 +539,115 @@ pub(crate) fn move_image(
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
+    let found = date_sources
+        .iter()
+        .find_map(|source| match source {
+            DateSource::Exif => date_from_exif(meta_data.as_ref()),
+            DateSource::Filename => {
+                datetime_from_filename(file_stem).map(|(date, time)| {
+                    FoundDate {
+                        date,
+                        time: time.map(|t| (t.hour(), t.minute(), t.second())),
+                        source: DateSource::Filename,
+                    }
+                })
+            }
+            DateSource::Folders => source_file
+                .parent()
+                .and_then(date_from_folders)
+                .map(|date| FoundDate {
+                    date,
+                    time: None,
+                    source: DateSource::Folders,
+                }),
+        })
+        .with_context(|| {
+            format!(
+                "No timestamp in {} of '{}'.",
+                date_sources
+                    .iter()
+                    .map(|s| match s {
+                        DateSource::Exif => "EXIF",
+                        DateSource::Filename => "the filename",
+                        DateSource::Folders => "the containing folders",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                source_file.display()
+            )
+        })?;
+
+    // A date taken from the path is only trusted for a file that is really
+    // an image or movie, checked independently of its extension.
+    if found.source != DateSource::Exif
+        && !is_media_file(source_file).with_context(|| {
+            format!(
+                "Unable to check '{}' for a media signature.",
+                source_file.display()
+            )
+        })?
+    {
+        return Err(anyhow!(
+            "'{}' is not recognized as an image or movie; refusing to trust \
+             its {} date.",
+            source_file.display(),
+            if found.source == DateSource::Filename {
+                "filename"
+            } else {
+                "folder"
+            }
+        ));
+    }
+
+    if found.source != DateSource::Exif {
+        info!(
+            "Using {} date {} for '{}'.",
+            if found.source == DateSource::Filename {
+                "filename"
+            } else {
+                "folder"
+            },
+            found.date,
+            source_file.display()
+        );
+    }
+
+    // Only a known time of day can wrap into the next day.
+    let date = if let Some((hour, minute, _)) = found.time
+        && day_wrap(hour, minute, time_offset) == 1
+    {
+        found.date.checked_add_days(Days::new(1)).with_context(|| {
+            format!("Date overflow for '{}'.", source_file.display())
+        })?
+    } else {
+        found.date
+    };
+
+    let (hour, minute, second) = found.time.unwrap_or((0, 0, 0));
+
+    let album = source_file.parent().and_then(album_from_path).map(|album| {
+        if make_lowercase {
+            album.to_lowercase()
+        } else {
+            album
+        }
+    });
+
+    require_album_if_needed(
+        found.source,
+        template,
+        album.as_deref(),
+        source_file,
+    )?;
+
     // Build template context.
     let ctx = TemplateContext {
         year: format!("{}", date.year()),
         month: format!("{:02}", date.month()),
         day: format!("{:02}", date.day()),
-        hour: format!("{:02}", time_stamp.hour),
-        minute: format!("{:02}", time_stamp.minute),
-        second: format!("{:02}", time_stamp.second),
+        hour: format!("{:02}", hour),
+        minute: format!("{:02}", minute),
+        second: format!("{:02}", second),
         filename: if make_lowercase {
             file_stem.to_lowercase()
         } else {
@@ -505,19 +658,13 @@ pub(crate) fn move_image(
         } else {
             extension.to_string()
         },
-        camera_make: exif_string(&meta_data, Tag::Make),
-        camera_model: exif_string(&meta_data, Tag::Model),
-        lens: exif_string(&meta_data, Tag::LensModel),
-        iso: exif_string(&meta_data, Tag::PhotographicSensitivity),
-        focal_length: exif_string(&meta_data, Tag::FocalLength)
+        camera_make: exif_string(meta_data.as_ref(), Tag::Make),
+        camera_model: exif_string(meta_data.as_ref(), Tag::Model),
+        lens: exif_string(meta_data.as_ref(), Tag::LensModel),
+        iso: exif_string(meta_data.as_ref(), Tag::PhotographicSensitivity),
+        focal_length: exif_string(meta_data.as_ref(), Tag::FocalLength)
             .map(|s| s.trim_end_matches("-mm").to_string()),
-        album: source_file.parent().and_then(album_from_path).map(|album| {
-            if make_lowercase {
-                album.to_lowercase()
-            } else {
-                album
-            }
-        }),
+        album,
     };
 
     // Expand template to get relative path.
@@ -572,18 +719,39 @@ pub(crate) fn move_image(
 
 /// Extract a string value from EXIF metadata.
 /// Spaces are replaced with hyphens for filesystem-friendly paths.
-fn exif_string(meta_data: &exif::Exif, tag: Tag) -> Option<String> {
-    meta_data
+/// A date taken from the path (rather than EXIF) is only good enough for a
+/// template that spells out `{album}` if an album was actually found;
+/// otherwise the file would silently land under `unknown`.
+pub(crate) fn require_album_if_needed(
+    date_source: DateSource,
+    template: &Template,
+    album: Option<&str>,
+    source_file: &Path,
+) -> Result<()> {
+    if date_source != DateSource::Exif
+        && template.uses("album")
+        && album.is_none()
+    {
+        return Err(anyhow!(
+            "No album found in the path of '{}'.",
+            source_file.display()
+        ));
+    }
+    Ok(())
+}
+
+fn exif_string(meta_data: Option<&exif::Exif>, tag: Tag) -> Option<String> {
+    meta_data?
         .get_field(tag, exif::In::PRIMARY)
         .map(|f| f.display_value().to_string().trim().replace(' ', "-"))
         .filter(|s| !s.is_empty())
 }
 
-pub(crate) fn day_wrap(time_stamp: &DateTime, time_offset: &NaiveTime) -> u8 {
+pub(crate) fn day_wrap(hour: u32, minute: u32, time_offset: &NaiveTime) -> u8 {
     // Hour wrap.
-    if time_stamp.hour as u32 + time_offset.hour() + {
+    if hour + time_offset.hour() + {
         // Minute wrap.
-        if time_stamp.minute as u32 + time_offset.minute() > 59 {
+        if minute + time_offset.minute() > 59 {
             1
         } else {
             0
@@ -600,35 +768,10 @@ pub(crate) fn day_wrap(time_stamp: &DateTime, time_offset: &NaiveTime) -> u8 {
 fn test_day_wrap() {
     assert_eq!(
         1,
-        day_wrap(
-            &DateTime {
-                year: 2023,
-                month: 8,
-                day: 21,
-                hour: 23,
-                minute: 59,
-                second: 0,
-                nanosecond: None,
-                offset: None,
-            },
-            &NaiveTime::from_hms_opt(0, 1, 0).unwrap(),
-        ),
+        day_wrap(23, 59, &NaiveTime::from_hms_opt(0, 1, 0).unwrap())
     );
-
     assert_eq!(
         0,
-        day_wrap(
-            &DateTime {
-                year: 2023,
-                month: 8,
-                day: 21,
-                hour: 23,
-                minute: 59,
-                second: 0,
-                nanosecond: None,
-                offset: None,
-            },
-            &NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-        ),
+        day_wrap(23, 59, &NaiveTime::from_hms_opt(0, 0, 0).unwrap())
     );
 }

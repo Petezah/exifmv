@@ -10,6 +10,54 @@ pub const DEFAULT_FORMAT: &str = "{year}/{month}/{day}/{filename}.{extension}";
 /// Application name for confy.
 const APP_NAME: &str = "exifmv";
 
+/// A source `exifmv` can take a file's date from, in addition to EXIF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DateSource {
+    /// The EXIF `DateTimeOriginal` tag.
+    Exif,
+    /// A date (and, if present, a time) encoded in the file name.
+    Filename,
+    /// A date encoded in the names of the folders the file lives in.
+    Folders,
+}
+
+impl std::str::FromStr for DateSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "exif" => Ok(Self::Exif),
+            "filename" => Ok(Self::Filename),
+            "folders" => Ok(Self::Folders),
+            _ => Err(format!(
+                "'{s}' is not a valid date source. Valid sources: exif, filename, folders."
+            )),
+        }
+    }
+}
+
+/// Order the sources to try a file's date from: put `exif` first if the
+/// caller didn't mention it, and drop any source repeated later in the list.
+pub fn date_sources(mut sources: Vec<DateSource>) -> Vec<DateSource> {
+    if sources.is_empty() {
+        return vec![DateSource::Exif];
+    }
+    if !sources.contains(&DateSource::Exif) {
+        sources.insert(0, DateSource::Exif);
+    }
+    let mut seen = Vec::with_capacity(sources.len());
+    sources.retain(|source| {
+        if seen.contains(source) {
+            false
+        } else {
+            seen.push(*source);
+            true
+        }
+    });
+    sources
+}
+
 /// Configuration loaded from TOML file.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -30,6 +78,9 @@ pub struct Config {
     pub dereference: Option<bool>,
     /// Use checksum for duplicate detection instead of size.
     pub checksum: Option<bool>,
+    /// Sources to try a file's date from, in priority order, when EXIF alone
+    /// isn't enough. `exif` is implied first if not listed.
+    pub date_from: Option<Vec<DateSource>>,
 }
 
 impl Config {
@@ -76,5 +127,37 @@ verbose = false
         let config: Config = toml::from_str("").unwrap();
         assert!(config.format.is_none());
         assert!(config.make_lowercase.is_none());
+        assert!(config.date_from.is_none());
+    }
+
+    #[test]
+    fn parse_config_date_from() {
+        let toml = r#"date-from = ["folders", "filename"]"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.date_from,
+            Some(vec![DateSource::Folders, DateSource::Filename])
+        );
+    }
+
+    #[test]
+    fn date_sources_orders_and_dedups() {
+        assert_eq!(date_sources(vec![]), vec![DateSource::Exif]);
+        assert_eq!(
+            date_sources(vec![DateSource::Folders]),
+            vec![DateSource::Exif, DateSource::Folders]
+        );
+        assert_eq!(
+            date_sources(vec![DateSource::Folders, DateSource::Exif]),
+            vec![DateSource::Folders, DateSource::Exif]
+        );
+        assert_eq!(
+            date_sources(vec![
+                DateSource::Folders,
+                DateSource::Folders,
+                DateSource::Exif
+            ]),
+            vec![DateSource::Folders, DateSource::Exif]
+        );
     }
 }
